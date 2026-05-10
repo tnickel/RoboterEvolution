@@ -1,0 +1,795 @@
+"""
+neat_ai.py – NEAT-Neuroevolution fuer das Neuro-Oekosystem.
+
+Stufe 4: Co-Evolution mit zwei separaten Populationen
+(Sammler und Jaeger) in derselben Welt.
+
+Enthaelt:
+- CoEvolutionManager: Verwaltet zwei NEAT-Populationen parallel
+- Integration mit Hall of Fame und Spatial Grid
+"""
+
+import os
+import math
+import random
+import pickle
+import time
+import neat
+import pygame
+from config.config_manager import SimConfig
+from core.world import World
+from core.entities import Collector, Hunter, Battery
+from core.sensors import draw_sensors, cast_rays_batch
+from core.spatial_grid import SpatialGrid
+from ai.hall_of_fame import HallOfFame, HallOfFameEntry
+from ui.commentary import CommentaryWindow
+from ui.stats_graph import StatsGraphWindow
+from ui.brain_viewer import BrainViewerWindow
+from ui.hall_of_fame_window import HallOfFameWindow
+
+
+# --- Farb-Konstanten fuer HUD ------------------------------------------------
+COLOR_HUD_BG = (18, 18, 24, 180)
+COLOR_HUD_TEXT = (255, 255, 255)  # Reines Weiß für hohen Kontrast
+COLOR_HUD_ACCENT = (0, 200, 150)
+COLOR_HUD_WARN = (230, 200, 50)
+COLOR_HUD_GEN = (255, 255, 255)   # Reines Weiß für hohen Kontrast
+COLOR_HUD_HUNTER = (230, 80, 80)
+COLOR_HUD_COLLECTOR = (0, 200, 120)
+
+FPS_TARGET = 60
+
+
+def _load_neat_config(config_path: str, pop_size: int,
+                      num_inputs: int, num_outputs: int = 3) -> neat.Config:
+    """Laedt und konfiguriert eine NEAT-Config-Datei.
+
+    Erstellt eine temporaere Kopie mit angepassten Werten fuer
+    pop_size und num_inputs, damit NEAT von Anfang an die
+    richtige Topologie verwendet.
+
+    Args:
+        config_path: Pfad zur NEAT-Config-Datei.
+        pop_size: Populationsgroesse.
+        num_inputs: Anzahl Inputs.
+        num_outputs: Anzahl Outputs.
+
+    Returns:
+        Konfigurierte neat.Config Instanz.
+    """
+    import tempfile
+
+    full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             config_path)
+
+    # Config-Datei lesen und dynamische Werte ersetzen
+    with open(full_path, 'r') as f:
+        content = f.read()
+
+    # num_inputs, num_outputs und pop_size in der Config ersetzen
+    import re
+    content = re.sub(r'num_inputs\s*=\s*\d+', f'num_inputs              = {num_inputs}', content)
+    content = re.sub(r'num_outputs\s*=\s*\d+', f'num_outputs              = {num_outputs}', content)
+    content = re.sub(r'pop_size\s*=\s*\d+', f'pop_size              = {pop_size}', content)
+
+    # Temporaere Config-Datei schreiben
+    tmp_dir = os.path.dirname(full_path)
+    tmp_path = os.path.join(tmp_dir, f"_tmp_{os.path.basename(config_path)}")
+    with open(tmp_path, 'w') as f:
+        f.write(content)
+
+    config = neat.Config(
+        neat.DefaultGenome,
+        neat.DefaultReproduction,
+        neat.DefaultSpeciesSet,
+        neat.DefaultStagnation,
+        tmp_path
+    )
+
+    # Temporaere Datei aufräumen
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
+
+    return config
+
+
+class CoEvolutionManager:
+    """Verwaltet die Co-Evolution zweier NEAT-Populationen.
+
+    Sammler und Jaeger werden gleichzeitig in derselben Welt simuliert.
+    Beide Populationen haben getrennte Fitness-Funktionen und evolvieren
+    parallel. Ein Spatial Grid optimiert die Performance.
+
+    Attributes:
+        sim_config: Simulationskonfiguration
+        hall: Hall of Fame
+        collector_pop: NEAT-Population der Sammler
+        hunter_pop: NEAT-Population der Jaeger
+        generation: Aktuelle Generation
+        best_collector_fitness: Beste Sammler-Fitness
+        best_hunter_fitness: Beste Jaeger-Fitness
+    """
+
+    def __init__(self, sim_config: SimConfig, hall: HallOfFame,
+                 commentary: CommentaryWindow | None = None,
+                 stats_graph: StatsGraphWindow | None = None,
+                 hof_window: HallOfFameWindow | None = None,
+                 injected_entries: list[HallOfFameEntry] | None = None) -> None:
+        self.sim_config = sim_config
+        self.hall = hall
+        self.commentary = commentary
+        self.stats_graph = stats_graph
+        self.hof_window = hof_window
+        self.generation = 0
+        self.best_collector_fitness = 0.0
+        self.best_hunter_fitness = 0.0
+        self.avg_collector_fitness = 0.0
+        self.avg_hunter_fitness = 0.0
+
+        # Welt einmalig erstellen (wird alle 10 Generationen erneuert)
+        self.world = World(sim_config)
+        self.world_regen_interval = 10
+
+        num_inputs = sim_config.sensor_ray_count * 5 + 1  # 5 Werte pro Strahl + 1 globaler Radio-Input
+
+        # --- Sammler-Population -----------------------------------------------
+        self.collector_config = _load_neat_config(
+            "config-collector.txt", sim_config.collector_pop_size, num_inputs)
+        self.collector_pop = neat.Population(self.collector_config)
+
+        # --- Jaeger-Population ------------------------------------------------
+        self.hunter_config = _load_neat_config(
+            "config-hunter.txt", sim_config.hunter_pop_size, num_inputs)
+        self.hunter_pop = neat.Population(self.hunter_config)
+
+        # Hall-of-Fame Genome injizieren (nur Sammler)
+        if injected_entries:
+            self._inject_genomes(injected_entries)
+
+        # Reporter
+        self.collector_stats = neat.StatisticsReporter()
+        self.collector_pop.add_reporter(self.collector_stats)
+
+        self.hunter_stats = neat.StatisticsReporter()
+        self.hunter_pop.add_reporter(self.hunter_stats)
+
+        print(f"[NEAT] Co-Evolution erstellt:")
+        print(f"  Sammler: {sim_config.collector_pop_size} Genome")
+        print(f"  Jaeger:  {sim_config.hunter_pop_size} Genome")
+        print(f"  Inputs:  {num_inputs}, Outputs: 3")
+        if injected_entries:
+            print(f"  Injiziert: {len(injected_entries)} Hall-of-Fame Genome")
+
+    def _inject_genomes(self, entries: list[HallOfFameEntry]) -> None:
+        """Injiziert Hall-of-Fame Genome in die Sammler-Population."""
+        pop = self.collector_pop.population
+        pop_ids = list(pop.keys())
+
+        for i, entry in enumerate(entries):
+            if i >= len(pop_ids):
+                break
+            try:
+                old_id = pop_ids[i]
+                loaded_genome = self.hall.get_genome(entry)
+                loaded_genome.is_injected = True  # Flag für Visualisierung
+                new_id = max(pop.keys()) + 1
+                loaded_genome.key = new_id
+                del pop[old_id]
+                pop[new_id] = loaded_genome
+                print(f"[NEAT] Injiziert: {entry.name} (Fitness={entry.fitness:.1f})")
+            except Exception as e:
+                print(f"[NEAT] Fehler beim Injizieren von {entry.name}: {e}")
+
+    def run_generation(self, screen: pygame.Surface | None,
+                       clock: pygame.time.Clock,
+                       show_sensors: bool, training_mode: bool,
+                       speed_multiplier: int) -> tuple[bool, bool, bool, int]:
+        """Fuehrt eine Generation der Co-Evolution durch.
+
+        Args:
+            screen: Pygame-Screen (None = kein Rendering)
+            clock: Pygame-Clock
+            show_sensors: Ob Sensoren gezeichnet werden
+            training_mode: Ob im schnellen Training-Modus
+            speed_multiplier: Simulationsschritte pro Frame
+
+        Returns:
+            Tuple (continue, show_sensors, training_mode, speed_multiplier)
+            continue=False wenn Benutzer beendet hat.
+        """
+        # --- Welt: Wiederverwenden oder alle N Generationen erneuern ----------
+        if self.generation > 0 and self.generation % self.world_regen_interval == 0:
+            self.world = World(self.sim_config)
+            print(f"[NEAT] Neue Welt generiert (alle {self.world_regen_interval} Generationen)")
+        world = self.world
+        # Batterien zuruecksetzen fuer neue Runde
+        for b in world.batteries:
+            b.active = True
+            b.respawn_timer = 0
+        grid = SpatialGrid(cell_size=100)
+
+        # --- Sammler erstellen -------------------------------------------------
+        collector_genomes = list(self.collector_pop.population.items())
+        collectors: list[Collector] = []
+        collector_genome_list = []
+        collector_nets = []
+
+        for genome_id, genome in collector_genomes:
+            genome.fitness = 0.0
+            net = neat.nn.FeedForwardNetwork.create(genome, self.collector_config)
+            x, y = world.spawn_robot_position()
+            c = Collector(x, y, self.sim_config)
+            c.genome = genome
+            c.net = net
+            c.is_injected = getattr(genome, 'is_injected', False)
+            collectors.append(c)
+            collector_genome_list.append(genome)
+            collector_nets.append(net)
+
+        # --- Gast-Sammler aus Hall of Fame injizieren (n+5) -------------------
+        if self.hall.entries:
+            num_guests = min(5, len(self.hall.entries))
+            # Wähle die 5 besten (neuesten) Einträge oder zufällig
+            # Da wir die "Besten" wollen, nehmen wir sie sortiert nach Fitness oder einfach die letzen 5
+            # sorted_entries = sorted(self.hall.entries, key=lambda e: e.fitness, reverse=True)
+            # Wir nehmen der Einfachheit halber bis zu 5 zufällige oder die Top 5
+            top_entries = sorted(self.hall.entries, key=lambda e: e.fitness, reverse=True)[:num_guests]
+            
+            for guest_entry in top_entries:
+                try:
+                    guest_genome = pickle.loads(guest_entry.genome_data)
+                    # Prüfe ob Genom kompatibel ist (gleiche Input-Anzahl)
+                    expected_inputs = self.sim_config.sensor_ray_count * 5 + 1
+                    guest_net_test = neat.nn.FeedForwardNetwork.create(guest_genome, self.collector_config)
+                    test_input = [0.0] * expected_inputs
+                    guest_net_test.activate(test_input)  # Test ob es funktioniert
+
+                    guest_genome.fitness = 0.0
+                    guest_genome.is_guest = True
+                    guest_genome.is_injected = True
+                    x, y = world.spawn_robot_position()
+                    c = Collector(x, y, self.sim_config)
+                    c.genome = guest_genome
+                    c.net = guest_net_test
+                    c.is_injected = True
+                    collectors.append(c)
+                    collector_genome_list.append(guest_genome)
+                    collector_nets.append(guest_net_test)
+                except Exception as e:
+                    print(f"[NEAT] Gast-Roboter uebersprungen (inkompatibel): {e}")
+
+        # --- Jaeger erstellen --------------------------------------------------
+        hunter_genomes = list(self.hunter_pop.population.items())
+        hunters: list[Hunter] = []
+        hunter_genome_list = []
+        hunter_nets = []
+
+        for genome_id, genome in hunter_genomes:
+            genome.fitness = 0.0
+            net = neat.nn.FeedForwardNetwork.create(genome, self.hunter_config)
+            x, y = world.spawn_robot_position()
+            h = Hunter(x, y, self.sim_config)
+            h.genome = genome
+            h.net = net
+            hunters.append(h)
+            hunter_genome_list.append(genome)
+            hunter_nets.append(net)
+
+        all_robots = collectors + hunters
+
+        # Commentary: Generation Start
+        if self.commentary:
+            self.commentary.post_event("gen_start",
+                gen=self.generation,
+                collectors=len(collectors),
+                hunters=len(hunters))
+
+        # --- Simulation --------------------------------------------------------
+        total_frames = self.sim_config.simulation_frames
+        current_step = 0
+        gen_start_time = time.time()
+
+        # Initiale Speed-Anzeige
+        if self.stats_graph:
+            self.stats_graph.update_speed_label(speed_multiplier)
+
+        while current_step < total_frames:
+            # Externe Kommandos vom Graph-Fenster
+            if self.stats_graph:
+                for cmd in self.stats_graph.get_commands():
+                    if cmd == "turbo_on":
+                        training_mode = True
+                        speed_multiplier = 500
+                        self.stats_graph.update_speed_label(speed_multiplier)
+                        print("[NEAT] Turbo AN (Training-Modus)")
+                    elif cmd == "turbo_off":
+                        training_mode = False
+                        speed_multiplier = 1
+                        self.stats_graph.update_speed_label(speed_multiplier)
+                        print("[NEAT] Turbo AUS (Visualisierung)")
+                    elif cmd == "open_brain_viewer":
+                        num_in = self.sim_config.sensor_ray_count * 5 + 1
+                        viewer = BrainViewerWindow(self.hall, num_inputs=num_in, num_outputs=3)
+                        viewer.start()
+                    elif cmd == "toggle_sensors":
+                        show_sensors = not show_sensors
+
+            # Pygame Events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return (False, show_sensors, training_mode, speed_multiplier)
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        return (False, show_sensors, training_mode, speed_multiplier)
+                    elif event.key == pygame.K_s:
+                        show_sensors = not show_sensors
+                    elif event.key == pygame.K_t:
+                        training_mode = not training_mode
+                        print(f"[NEAT] Modus: {'Training' if training_mode else 'Visualisierung'}")
+                    elif event.key == pygame.K_PLUS or event.key == pygame.K_KP_PLUS:
+                        speed_multiplier = min(100, speed_multiplier + 1)
+                        if self.stats_graph:
+                            self.stats_graph.update_speed_label(speed_multiplier)
+                        print(f"[NEAT] Speed: {speed_multiplier}x")
+                    elif event.key == pygame.K_MINUS or event.key == pygame.K_KP_MINUS:
+                        speed_multiplier = max(1, speed_multiplier - 1)
+                        if self.stats_graph:
+                            self.stats_graph.update_speed_label(speed_multiplier)
+                        print(f"[NEAT] Speed: {speed_multiplier}x")
+
+            # Simulation-Steps
+            # Im Turbo: Ganze Generation am Stueck (kein Pygame-Overhead)
+            steps = speed_multiplier if not training_mode else total_frames - current_step
+            steps = min(steps, total_frames - current_step)
+
+            # Performance-Caches (ausserhalb der Schleife erstellen)
+            collector_sensor_range = self.sim_config.collector_sensor_ray_length
+            hunter_sensor_range = self.sim_config.hunter_sensor_ray_length
+            walls = world.walls
+            obstacles = world.obstacles
+            w_width = world.width
+            w_height = world.height
+            idle_penalty = self.sim_config.fitness_idle_penalty
+            survival_bonus = self.sim_config.fitness_survival_bonus
+            battery_bonus = self.sim_config.fitness_battery_collected
+            kill_bonus = self.sim_config.fitness_hunter_kill
+            eaten_penalty = self.sim_config.fitness_eaten_penalty
+            energy_refill = self.sim_config.energy_start
+            bat_proximity_bonus = self.sim_config.fitness_battery_proximity
+            hunter_danger_penalty = self.sim_config.fitness_hunter_danger
+            danger_zone = self.sim_config.fitness_danger_zone
+
+            for step_i in range(steps):
+                current_step += 1
+
+                # Spatial Grid aktualisieren
+                grid.clear()
+                for r in all_robots:
+                    if r.alive:
+                        grid.insert(r)
+                for b in world.batteries:
+                    if b.active:
+                        grid.insert(b)
+
+                # --- Radio-Signale verarbeiten --------------------------------
+                radio_range = self.sim_config.radio_range
+                for r in all_robots:
+                    if not r.alive:
+                        continue
+                    # Alle anderen Roboter im Umkreis finden
+                    nearby = grid.get_nearby(r, radio_range)
+                    # Maximales Funksignal der lebenden Nachbarn ermitteln
+                    max_signal = 0.0
+                    for nr in nearby:
+                        if isinstance(nr, (Collector, Hunter)) and nr is not r and nr.alive:
+                            if nr.radio_out > max_signal:
+                                max_signal = nr.radio_out
+                    r.radio_in = max_signal
+
+                # Sensoren nur jeden 2. Frame im Turbo aktualisieren
+                # (halbiert die teuerste Berechnung - Raycasting)
+                update_sensors_flag = (not training_mode) or (step_i % 2 == 0)
+
+                # --- Sensoren: Parallel (Turbo) oder Einzeln (Normal) ---------
+                if update_sensors_flag:
+                    if training_mode:
+                        # TURBO: Parallele Batch-Berechnung auf allen CPU-Kernen
+                        cast_rays_batch(collectors, walls, world.batteries,
+                                        all_robots, self.sim_config)
+                        cast_rays_batch(hunters, walls, world.batteries,
+                                        all_robots, self.sim_config)
+                    else:
+                        # NORMAL: Spatial-Grid-basierte Einzelberechnung
+                        for c in collectors:
+                            if not c.alive:
+                                continue
+                            nearby = grid.get_nearby(c, collector_sensor_range)
+                            nearby_bats = [e for e in nearby if isinstance(e, Battery)]
+                            nearby_robs = [e for e in nearby
+                                           if isinstance(e, (Collector, Hunter)) and e is not c]
+                            c.update_sensors(walls, nearby_bats, [c] + nearby_robs)
+                        for h in hunters:
+                            if not h.alive:
+                                continue
+                            nearby = grid.get_nearby(h, hunter_sensor_range)
+                            nearby_bats = [e for e in nearby if isinstance(e, Battery)]
+                            nearby_robs = [e for e in nearby
+                                           if isinstance(e, (Collector, Hunter)) and e is not h]
+                            h.update_sensors(walls, nearby_bats, [h] + nearby_robs)
+
+                # --- Sammler Update -------------------------------------------
+                for i, c in enumerate(collectors):
+                    if not c.alive:
+                        continue
+
+                    # Neuronales Netz
+                    inputs = c.get_sensor_inputs()
+                    if not inputs:
+                        continue
+                    output = collector_nets[i].activate(inputs)
+                    
+                    radio_out = output[2] if len(output) > 2 else 0.0
+                    c.move(output[0], output[1], radio_out)
+                    c.clamp_to_bounds(w_width, w_height)
+                    c.check_obstacle_collision(obstacles)
+
+                    # Energie + Fitness
+                    c.drain_energy()
+                    if abs(c.motor_left) < 0.1 and abs(c.motor_right) < 0.1:
+                        collector_genome_list[i].fitness += idle_penalty
+                    collector_genome_list[i].fitness += survival_bonus
+
+                    # Batterie sammeln
+                    if world.check_battery_collision(c):
+                        c.batteries_collected += 1
+                        collector_genome_list[i].fitness += battery_bonus
+
+                    # ── Proximity-Bonus: Richtung Batterie ──
+                    # Kleine Belohnung wenn nahe an einer Batterie (Gradient zum Futter)
+                    nearest_bat_dist = float('inf')
+                    for b in world.batteries:
+                        if b.active:
+                            dx = c.x - b.x
+                            dy = c.y - b.y
+                            d = (dx * dx + dy * dy) ** 0.5
+                            if d < nearest_bat_dist:
+                                nearest_bat_dist = d
+                    if nearest_bat_dist < collector_sensor_range:
+                        # Je naeher, desto mehr Bonus
+                        collector_genome_list[i].fitness += bat_proximity_bonus * (1.0 - nearest_bat_dist / collector_sensor_range)
+
+                    # ── Proximity-Malus: Weg vom Jaeger ──
+                    # Strafe wenn zu nahe an Jaeger (Gradient weg von Gefahr)
+                    for hu in hunters:
+                        if not hu.alive:
+                            continue
+                        dx = c.x - hu.x
+                        dy = c.y - hu.y
+                        d = (dx * dx + dy * dy) ** 0.5
+                        if d < danger_zone:
+                            collector_genome_list[i].fitness -= hunter_danger_penalty * (1.0 - d / danger_zone)
+
+                # --- Jaeger Update --------------------------------------------
+                for i, h in enumerate(hunters):
+                    if not h.alive:
+                        continue
+
+                    # Neuronales Netz
+                    inputs = h.get_sensor_inputs()
+                    if not inputs:
+                        continue
+                    output = hunter_nets[i].activate(inputs)
+                    
+                    radio_out = output[2] if len(output) > 2 else 0.0
+                    h.move(output[0], output[1], radio_out)
+                    h.clamp_to_bounds(w_width, w_height)
+                    h.check_obstacle_collision(obstacles)
+
+                    # Energie + Fitness
+                    h.drain_energy()
+                    if abs(h.motor_left) < 0.1 and abs(h.motor_right) < 0.1:
+                        hunter_genome_list[i].fitness += idle_penalty
+
+                    # ── Proximity-Bonus: Richtung Sammler ──
+                    # Jaeger bekommen Bonus wenn nahe an Sammlern
+                    nearest_prey_dist = float('inf')
+                    for prey in collectors:
+                        if not prey.alive:
+                            continue
+                        dx = h.x - prey.x
+                        dy = h.y - prey.y
+                        d = (dx * dx + dy * dy) ** 0.5
+                        if d < nearest_prey_dist:
+                            nearest_prey_dist = d
+                    if nearest_prey_dist < hunter_sensor_range:
+                        hunter_genome_list[i].fitness += 0.1 * (1.0 - nearest_prey_dist / hunter_sensor_range)
+
+                    # Sammler fressen (Kollisionspruefung)
+                    nearby_collectors = [e for e in
+                                         grid.get_nearby(h, h.radius + 20)
+                                         if isinstance(e, Collector) and e.alive]
+                    for prey in nearby_collectors:
+                        dx = h.x - prey.x
+                        dy = h.y - prey.y
+                        dist_sq = dx * dx + dy * dy
+                        catch_dist = h.radius + prey.radius
+                        if dist_sq < catch_dist * catch_dist:
+                            # Sammler gefressen!
+                            prey.alive = False
+                            h.kills += 1
+                            h.add_energy(energy_refill)
+                            hunter_genome_list[i].fitness += kill_bonus
+                            # Sammler bekommt Strafe
+                            prey_idx = collectors.index(prey)
+                            collector_genome_list[prey_idx].fitness += eaten_penalty
+
+                # Welt updaten
+                world.update()
+
+            # --- Rendering ----------------------------------------------------
+            if not training_mode and screen is not None:
+                world.draw(screen)
+                for r in all_robots:
+                    draw_sensors(screen, r, show_sensors)
+                    r.draw(screen)
+                self._draw_hud(screen, clock, collectors, hunters, world,
+                               current_step, total_frames)
+                pygame.display.flip()
+                clock.tick(FPS_TARGET)
+
+        # --- Fitness finalisieren ---------------------------------------------
+        c_fits = [g.fitness for g in collector_genome_list]
+        h_fits = [g.fitness for g in hunter_genome_list]
+
+        self.avg_collector_fitness = sum(c_fits) / len(c_fits) if c_fits else 0
+        self.best_collector_fitness = max(c_fits) if c_fits else 0
+        self.avg_hunter_fitness = sum(h_fits) / len(h_fits) if h_fits else 0
+        self.best_hunter_fitness = max(h_fits) if h_fits else 0
+
+        total_kills = sum(h.kills for h in hunters)
+        total_bats = sum(c.batteries_collected for c in collectors)
+        alive_collectors = sum(1 for c in collectors if c.alive)
+
+        print(f"[NEAT] Gen {self.generation}: "
+              f"Sammler best={self.best_collector_fitness:.1f} avg={self.avg_collector_fitness:.1f} | "
+              f"Jaeger best={self.best_hunter_fitness:.1f} avg={self.avg_hunter_fitness:.1f} | "
+              f"Kills={total_kills} Batt={total_bats} Alive={alive_collectors}")
+
+        # --- Hall of Fame (beste Sammler) -------------------------------------
+        if c_fits:
+            # Den besten Sammler finden, der KEIN Gast ist
+            best_c_idx = -1
+            best_c_val = -999999
+            for i, c in enumerate(collectors):
+                if not getattr(c.genome, 'is_guest', False):
+                    if c_fits[i] > best_c_val:
+                        best_c_val = c_fits[i]
+                        best_c_idx = i
+
+            if best_c_idx != -1:
+                hof_entry = self.hall.try_add(
+                    genome=collector_genome_list[best_c_idx],
+                    fitness=best_c_val,
+                    generation=self.generation,
+                    batteries=collectors[best_c_idx].batteries_collected,
+                )
+                if hof_entry and self.commentary:
+                    self.commentary.post_event("hall_of_fame",
+                        name=hof_entry.name, fitness=hof_entry.fitness)
+
+        # Hall of Fame Fenster aktualisieren
+        if self.hof_window:
+            self.hof_window.notify_update()
+
+        # Commentary: Generation End
+        if self.commentary:
+            self.commentary.post_event("gen_end",
+                gen=self.generation,
+                best_c=self.best_collector_fitness,
+                best_h=self.best_hunter_fitness,
+                kills=total_kills,
+                alive=alive_collectors,
+                batteries=total_bats)
+
+        # Stats-Graph aktualisieren
+        if self.stats_graph:
+            gen_duration = time.time() - gen_start_time
+            self.stats_graph.add_generation(
+                gen=self.generation,
+                best_c=self.best_collector_fitness,
+                avg_c=self.avg_collector_fitness,
+                best_h=self.best_hunter_fitness,
+                avg_h=self.avg_hunter_fitness,
+                kills=total_kills,
+                alive=alive_collectors,
+                total_collectors=len(collectors),
+                batteries=total_bats,
+                gen_time=gen_duration)
+
+        # --- Naechste Generation ----------------------------------------------
+        # Sammler
+        self.collector_pop.species.speciate(
+            self.collector_config, self.collector_pop.population,
+            self.collector_pop.generation)
+        try:
+            self.collector_pop.population = self.collector_pop.reproduction.reproduce(
+                self.collector_config, self.collector_pop.species,
+                self.collector_config.pop_size, self.collector_pop.generation)
+        except AssertionError:
+            # Bekannter NEAT-Bug: Node-ID-Konflikt bei get_new_node_key
+            # Fix: Node-Indexer zuruecksetzen
+            print("[NEAT] WARNUNG: Node-ID-Konflikt bei Sammlern - setze Indexer zurueck")
+            genome_indexer = self.collector_pop.config.genome_config
+            if hasattr(genome_indexer, 'node_indexer'):
+                max_id = max(max(g.nodes.keys()) for g in self.collector_pop.population.values()) + 1
+                genome_indexer.node_indexer = max_id
+            self.collector_pop.population = self.collector_pop.reproduction.reproduce(
+                self.collector_config, self.collector_pop.species,
+                self.collector_config.pop_size, self.collector_pop.generation)
+        self.collector_pop.generation += 1
+
+        # Jaeger
+        self.hunter_pop.species.speciate(
+            self.hunter_config, self.hunter_pop.population,
+            self.hunter_pop.generation)
+        try:
+            self.hunter_pop.population = self.hunter_pop.reproduction.reproduce(
+                self.hunter_config, self.hunter_pop.species,
+                self.hunter_config.pop_size, self.hunter_pop.generation)
+        except AssertionError:
+            print("[NEAT] WARNUNG: Node-ID-Konflikt bei Jaegern - setze Indexer zurueck")
+            genome_indexer = self.hunter_pop.config.genome_config
+            if hasattr(genome_indexer, 'node_indexer'):
+                max_id = max(max(g.nodes.keys()) for g in self.hunter_pop.population.values()) + 1
+                genome_indexer.node_indexer = max_id
+            self.hunter_pop.population = self.hunter_pop.reproduction.reproduce(
+                self.hunter_config, self.hunter_pop.species,
+                self.hunter_config.pop_size, self.hunter_pop.generation)
+        self.hunter_pop.generation += 1
+
+        self.generation += 1
+        return (True, show_sensors, training_mode, speed_multiplier)
+
+    def _draw_hud(self, screen: pygame.Surface, clock: pygame.time.Clock,
+                  collectors: list[Collector], hunters: list[Hunter],
+                  world: World, frame: int, total_frames: int) -> None:
+        """Zeichnet das erweiterte HUD mit Co-Evolution-Statistiken und Hall of Fame."""
+        hud_width = 600
+        hud_height = 400
+        hud_surf = pygame.Surface((hud_width, hud_height), pygame.SRCALPHA)
+        hud_surf.fill(COLOR_HUD_BG)
+        screen.blit(hud_surf, (8, 8))
+
+        x = 16
+        y = 12
+        h = 36
+        font = pygame.font.SysFont("Segoe UI", 30, bold=True)
+        font_s = pygame.font.SysFont("Segoe UI", 24)
+
+        # FPS + Gen
+        fps = clock.get_fps()
+        fps_color = COLOR_HUD_ACCENT if fps >= 30 else COLOR_HUD_WARN
+        screen.blit(font.render(f"FPS: {fps:.0f}", True, fps_color), (x, y))
+        screen.blit(font_s.render(
+            f"Gen: {self.generation}  Frame: {frame}/{total_frames}",
+            True, COLOR_HUD_GEN), (x + 90, y + 2))
+
+        # Sammler-Stats
+        alive_c = sum(1 for c in collectors if c.alive)
+        screen.blit(font.render("Sammler", True, COLOR_HUD_COLLECTOR), (x, y + h * 1.5))
+        screen.blit(font_s.render(
+            f"Aktiv: {alive_c}/{len(collectors)}  "
+            f"Best: {self.best_collector_fitness:.0f}  "
+            f"Avg: {self.avg_collector_fitness:.0f}",
+            True, COLOR_HUD_TEXT), (x, y + h * 2.5))
+        total_bats = sum(c.batteries_collected for c in collectors)
+        screen.blit(font_s.render(
+            f"Batterien gesammelt: {total_bats}",
+            True, COLOR_HUD_TEXT), (x, y + h * 3.3))
+
+        # Jaeger-Stats
+        alive_h = sum(1 for hu in hunters if hu.alive)
+        screen.blit(font.render("Jaeger", True, COLOR_HUD_HUNTER), (x, y + h * 4.5))
+        screen.blit(font_s.render(
+            f"Aktiv: {alive_h}/{len(hunters)}  "
+            f"Best: {self.best_hunter_fitness:.0f}  "
+            f"Avg: {self.avg_hunter_fitness:.0f}",
+            True, COLOR_HUD_TEXT), (x, y + h * 5.5))
+        total_kills = sum(hu.kills for hu in hunters)
+        screen.blit(font_s.render(
+            f"Kills: {total_kills}",
+            True, COLOR_HUD_TEXT), (x, y + h * 6.3))
+
+        # Batterien
+        active_bat = sum(1 for b in world.batteries if b.active)
+        screen.blit(font_s.render(
+            f"Batterien aktiv: {active_bat}/{self.sim_config.battery_count}  |  "
+            f"Hall of Fame: {len(self.hall.entries)}",
+            True, COLOR_HUD_TEXT), (x, y + h * 7.5))
+
+        # Steuerungs-Hinweis
+        screen.blit(font_s.render(
+            "T=Training  S=Sensoren  +/-=Speed  ESC=Ende",
+            True, COLOR_HUD_TEXT), (x, y + h * 8.8))
+
+
+
+def run_neat_training(config: SimConfig, screen: pygame.Surface,
+                      clock: pygame.time.Clock, hall: HallOfFame,
+                      injected_entries: list[HallOfFameEntry] | None = None) -> None:
+    """Startet das Co-Evolution NEAT-Training mit Live-Kommentar.
+
+    Args:
+        config: Simulationskonfiguration.
+        screen: Pygame-Screen.
+        clock: Pygame-Clock.
+        hall: Hall of Fame Instanz.
+        injected_entries: Ausgewaehlte HoF-Eintraege zum Injizieren.
+    """
+    # Commentary + Graph starten
+    commentary = CommentaryWindow(offset_x=config.window_width)
+    commentary.start()
+
+    stats_graph = StatsGraphWindow(offset_x=config.window_width)
+    stats_graph.start()
+
+    hof_window = HallOfFameWindow(hall, offset_x=config.window_width)
+    hof_window.start()
+
+    manager = CoEvolutionManager(config, hall, commentary=commentary,
+                                 stats_graph=stats_graph,
+                                 hof_window=hof_window,
+                                 injected_entries=injected_entries)
+
+    show_sensors = False
+    training_mode = False
+    speed_multiplier = 1
+
+    print(f"[NEAT] Starte Co-Evolution (Unendlich)")
+    print(f"[NEAT] Tasten: T=Training, S=Sensoren, +/-=Speed, ESC=Beenden")
+
+    gen = 0
+    while True:
+        result = manager.run_generation(
+            screen, clock, show_sensors, training_mode, speed_multiplier)
+        cont, show_sensors, training_mode, speed_multiplier = result
+        if not cont:
+            print(f"[NEAT] Training abgebrochen in Generation {gen}")
+            commentary.post_event("custom",
+                text=f"Training nach {gen} Generationen beendet. Tschuess!",
+                tag="info")
+            break
+        gen += 1
+
+    print(f"[NEAT] Training beendet.")
+    print(f"  Sammler beste Fitness: {manager.best_collector_fitness:.1f}")
+    print(f"  Jaeger beste Fitness:  {manager.best_hunter_fitness:.1f}")
+    print(f"  Hall of Fame: {len(hall.entries)} Eintraege")
+
+    # Halte das Pygame-Fenster und die Graphen offen, bis der Nutzer sie schließt
+    if screen is not None:
+        font = pygame.font.SysFont("Segoe UI", 36, bold=True)
+        text = font.render("Training beendet. Schließe das Graphen-Fenster zum Beenden.", True, (255, 200, 0))
+        text_rect = text.get_rect(center=(screen.get_width() // 2, screen.get_height() // 2))
+        
+        # Hintergrund leicht abdunkeln
+        overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        screen.blit(overlay, (0, 0))
+        screen.blit(text, text_rect)
+        pygame.display.flip()
+
+    print("[NEAT] Warte auf das Schließen des Graphen-Fensters...")
+    
+    # Warte bis das Graphen-Fenster manuell geschlossen wird
+    while stats_graph.running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                stats_graph.stop()
+        clock.tick(30)
+
+    commentary.stop()
+    stats_graph.stop()
+    hof_window.stop()
