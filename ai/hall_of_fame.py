@@ -211,7 +211,9 @@ class HallOfFameMenu:
 
     def __init__(self, hall: HallOfFame) -> None:
         self.hall = hall
-        self.selected: set[int] = set()  # Indices der ausgewählten Einträge
+        # Standardmaessig die besten 5 Eintraege auswaehlen (oder weniger, wenn die Liste kleiner ist)
+        num_auto_select = min(5, len(self.hall.entries))
+        self.selected: set[int] = set(range(num_auto_select))
         self.running = True
         self.result = None  # 'start', 'back', None
         self.scroll_y = 0

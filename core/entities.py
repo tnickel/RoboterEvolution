@@ -181,6 +181,8 @@ class Robot:
         self.fit_battery = 0.0
         self.fit_prox = 0.0
         self.fit_hunter_pen = 0.0
+        self.fit_escape = 0.0
+        self.fit_approach = 0.0
         self.fit_death = 0.0
         self.fit_surv = 0.0
         self.fit_idle = 0.0
@@ -203,11 +205,10 @@ class Robot:
         """Gibt die Sensordaten als flache Liste für das neuronale Netz zurück.
 
         Returns:
-            Liste mit [dist, is_battery, is_hunter, is_wall, is_collector] pro Strahl,
-            plus 1 Wert für das empfangene Funksignal am Ende.
+            Liste mit [dist, is_battery, is_hunter, is_wall, is_collector] pro Strahl.
         """
         n = len(self.sensor_data)
-        inputs = [0.0] * (n * 5 + 1)  # Pre-allokiert statt append()
+        inputs = [0.0] * (n * 5)  # Pre-allokiert statt append()
         idx = 0
         for dist_norm, obj_type, _, _ in self.sensor_data:
             inputs[idx] = dist_norm
@@ -216,8 +217,6 @@ class Robot:
             inputs[idx + 3] = 1.0 if obj_type == 1 else 0.0  # Wand?
             inputs[idx + 4] = 1.0 if obj_type == 3 else 0.0  # Sammler? (Schwarm!)
             idx += 5
-        # Funksignal als globalen Input anhängen
-        inputs[idx] = self.radio_in
         return inputs
 
     def move(self, left_motor: float, right_motor: float, radio_out: float = 0.0, dt: float = 1.0) -> None:

@@ -45,7 +45,7 @@ class SimConfig:
     # ── Welt ──
     grid_size: int = 40              # N×N Felder (1600x1600 Pixel)
     cell_pixel_size: int = 40        # Pixel pro Feld (Fenster wird deutlich größer!)
-    obstacle_count: int = 30         # Anzahl zufälliger Hindernisse
+    obstacle_count: int = 25         # Anzahl zufälliger Hindernisse
 
     # ── Batterien ──
     battery_count: int = 100         # Gesamtzahl Batterien
@@ -58,10 +58,10 @@ class SimConfig:
     energy_death_threshold: float = 0.0  # Tod bei diesem Wert
 
     # ── Roboter ──
-    collector_speed: float = 4.5     # Geschwindigkeit Sammler (Deutlich schneller zur Flucht)
+    collector_speed: float = 6.5     # Geschwindigkeit Sammler (Deutlich schneller zur Flucht)
     hunter_speed: float = 3.8        # Geschwindigkeit Jäger (Aggressiver, erzwingt Fluchtreflex)
     robot_radius: float = 18.0       # Kollisionsradius Roboter
-    sensor_ray_count: int = 5        # Anzahl Sensor-Strahlen (5 reichen mit klaren Inputs)
+    sensor_ray_count: int = 7        # Anzahl Sensor-Strahlen (Erweitert für besseres Fluchtverhalten)
     collector_sensor_ray_length: float = 400.0 # Sammler sehen sehr weit (maximale Vorwarnzeit)
     collector_sensor_fov: float = 240.0        # Sammler haben seeehr weites Sichtfeld (peripheres Sehen)
     hunter_sensor_ray_length: float = 200.0    # Jäger sind kurzsichtiger
@@ -69,8 +69,8 @@ class SimConfig:
     radio_range: float = 200.0                 # Reichweite der Kommunikation (Antenne)
 
     # ── NEAT ──
-    collector_pop_size: int = 50     # Populationsgröße Sammler
-    hunter_pop_size: int = 10        # Populationsgröße Jäger (Wieder reduziert, damit Sammler atmen können)
+    collector_pop_size: int = 100     # Populationsgröße Sammler
+    hunter_pop_size: int = 20        # Populationsgröße Jäger (Wieder reduziert, damit Sammler atmen können)
     simulation_frames: int = 2500    # Frames pro Evaluierung (laenger = besseres Ueberlebens-Signal)
 
     # ── Fitness ──
@@ -82,8 +82,9 @@ class SimConfig:
 
     # ── Fitness-Gradient (Proximity) ──
     fitness_battery_proximity: float = 0.1   # Bonus/Frame wenn nahe an Batterie (Gradient zum Futter)
-    fitness_hunter_danger: float = 0.0       # KEINE STRAFE mehr für bloße Nähe! (Nur der Tod bestraft)
     fitness_danger_zone: float = 200.0       # Radius der Gefahrenzone (Reduziert auf 200, um Phantom-Panik zu vermeiden)
+    fitness_hunter_danger: float = 0.15      # Strafe/Frame in Jaeger-Naehe (Gradient: naeher = schlimmer)
+    fitness_hunter_approach_penalty: float = 15.0  # Extra-Strafe wenn Abstand zum Jaeger kleiner wird
 
     @property
     def window_width(self) -> int:
@@ -184,6 +185,7 @@ CONFIG_FIELDS = [
             ("fitness_eaten_penalty", "Gefressen-Strafe", -5000.0, 0.0, 50.0, float),
             ("fitness_battery_proximity", "Batterie-Nähe Bonus", 0.0, 1.0, 0.01, float),
             ("fitness_hunter_danger", "Jäger-Nähe Strafe", 0.0, 2.0, 0.05, float),
+            ("fitness_hunter_approach_penalty", "Jaeger-Annaeherung Strafe", 0.0, 20.0, 0.5, float),
             ("fitness_danger_zone", "Gefahrenzone (px)", 50.0, 400.0, 10.0, float),
         ]
     },

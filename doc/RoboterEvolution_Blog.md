@@ -145,7 +145,7 @@ Deshalb: **100 Sammler vs. nur 10 Jäger**. Sammler sind schneller (3.5 vs. 3.0)
 
 Die **Hall of Fame** speichert die 20 besten Roboter-Gehirne aller Zeiten. Diese dienen als evolutionäres Gedächtnis:
 
-- **Top 5 als Gäste**: In jeder Generation treten die 5 besten Genome aus der Hall of Fame als "Gast-Roboter" (🔵 blaue Punkte) an. Sie zeigen der aktuellen Population, was möglich ist.
+- **Live-Injektion (Gäste)**: In *jeder einzelnen Generation* schaut das System live in die aktuelle Hall of Fame. Die besten 5 Roboter werden sofort als unsterbliche "Gast-Roboter" (🔵 cyan-blaue Farbe) ins laufende Spiel eingespeist, um der aktuellen Population live als Vorbild zu dienen. Dies geschieht vollautomatisch im Hintergrund.
 - **Persistenz**: Die Hall of Fame wird als Pickle-Datei gespeichert und überlebt Neustarts.
 - **Live-Fenster**: Ein eigenständiges Tkinter-Fenster zeigt die Rangliste in Echtzeit – mit 🥇🥈🥉 Medaillen, Fitness-Scores und gesammelten Batterien.
 

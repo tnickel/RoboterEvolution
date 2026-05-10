@@ -10,6 +10,7 @@ Enthaelt:
 """
 
 import os
+import csv
 import math
 import random
 import pickle
@@ -39,6 +40,45 @@ COLOR_HUD_HUNTER = (230, 80, 80)
 COLOR_HUD_COLLECTOR = (0, 200, 120)
 
 FPS_TARGET = 60
+
+
+GENERATION_LOG_FIELDS = [
+    "run_id",
+    "timestamp",
+    "generation",
+    "duration_sec",
+    "training_mode",
+    "speed_multiplier",
+    "collectors_total",
+    "collectors_real",
+    "collectors_injected",
+    "collectors_alive",
+    "hunters_total",
+    "hunters_alive",
+    "batteries_collected",
+    "batteries_collected_real",
+    "kills",
+    "best_collector_fitness",
+    "avg_collector_fitness",
+    "best_hunter_fitness",
+    "avg_hunter_fitness",
+    "avg_fit_battery",
+    "avg_fit_proximity",
+    "avg_fit_survival",
+    "avg_fit_hunter_penalty",
+    "avg_fit_escape",
+    "avg_fit_approach",
+    "avg_fit_death",
+    "avg_fit_idle",
+    "collector_sees_hunter_frames",
+    "collector_danger_frames",
+    "collector_escape_events",
+    "collector_approach_events",
+    "collector_neutral_events",
+    "escape_ratio",
+    "approach_ratio",
+    "avg_nearest_hunter_dist",
+]
 
 
 def _load_neat_config(config_path: str, pop_size: int,
@@ -96,6 +136,24 @@ def _load_neat_config(config_path: str, pop_size: int,
     return config
 
 
+def _append_csv_row(path: str, fieldnames: list[str], row: dict) -> None:
+    """Appendet eine Zeile in eine CSV-Datei und schreibt bei Bedarf den Header."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    needs_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    if not needs_header:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            first_line = f.readline().strip()
+        if first_line and first_line.split(",") != fieldnames:
+            backup_path = path.replace(".csv", f"_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+            os.replace(path, backup_path)
+            needs_header = True
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if needs_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 class CoEvolutionManager:
     """Verwaltet die Co-Evolution zweier NEAT-Populationen.
 
@@ -128,12 +186,16 @@ class CoEvolutionManager:
         self.best_hunter_fitness = 0.0
         self.avg_collector_fitness = 0.0
         self.avg_hunter_fitness = 0.0
+        self.run_id = time.strftime("%Y%m%d_%H%M%S")
+        self.log_dir = os.path.join(os.getcwd(), "log")
+        self.generation_log_path = os.path.join(self.log_dir, "evolution_generations.csv")
+        os.makedirs(self.log_dir, exist_ok=True)
 
         # Welt einmalig erstellen (wird alle 10 Generationen erneuert)
         self.world = World(sim_config)
         self.world_regen_interval = 10
 
-        num_inputs = sim_config.sensor_ray_count * 5 + 1  # 5 Werte pro Strahl + 1 globaler Radio-Input
+        num_inputs = sim_config.sensor_ray_count * 5 + 2  # 5 Werte pro Strahl + 2 direkte (dx/dy) Nearest-Feind/Beute-Inputs
 
         # --- Sammler-Population -----------------------------------------------
         self.collector_config = _load_neat_config(
@@ -145,43 +207,10 @@ class CoEvolutionManager:
             "config-hunter.txt", sim_config.hunter_pop_size, num_inputs)
         self.hunter_pop = neat.Population(self.hunter_config)
 
-        # Hall-of-Fame Genome injizieren (nur Sammler)
-        if injected_entries:
-            self._inject_genomes(injected_entries)
+        # Hall-of-Fame Genome dauerhaft als Gaeste speichern
+        self.injected_entries = injected_entries or []
 
         # Reporter
-        self.collector_stats = neat.StatisticsReporter()
-        self.collector_pop.add_reporter(self.collector_stats)
-
-        self.hunter_stats = neat.StatisticsReporter()
-        self.hunter_pop.add_reporter(self.hunter_stats)
-
-        print(f"[NEAT] Co-Evolution erstellt:")
-        print(f"  Sammler: {sim_config.collector_pop_size} Genome")
-        print(f"  Jaeger:  {sim_config.hunter_pop_size} Genome")
-        print(f"  Inputs:  {num_inputs}, Outputs: 3")
-        if injected_entries:
-            print(f"  Injiziert: {len(injected_entries)} Hall-of-Fame Genome")
-
-    def _inject_genomes(self, entries: list[HallOfFameEntry]) -> None:
-        """Injiziert Hall-of-Fame Genome in die Sammler-Population."""
-        pop = self.collector_pop.population
-        pop_ids = list(pop.keys())
-
-        for i, entry in enumerate(entries):
-            if i >= len(pop_ids):
-                break
-            try:
-                old_id = pop_ids[i]
-                loaded_genome = self.hall.get_genome(entry)
-                loaded_genome.is_injected = True  # Flag für Visualisierung
-                new_id = max(pop.keys()) + 1
-                loaded_genome.key = new_id
-                del pop[old_id]
-                pop[new_id] = loaded_genome
-                print(f"[NEAT] Injiziert: {entry.name} (Fitness={entry.fitness:.1f})")
-            except Exception as e:
-                print(f"[NEAT] Fehler beim Injizieren von {entry.name}: {e}")
 
     def run_generation(self, screen: pygame.Surface | None,
                        clock: pygame.time.Clock,
@@ -231,38 +260,38 @@ class CoEvolutionManager:
             collector_genome_list.append(genome)
             collector_nets.append(net)
 
-        # --- Gast-Sammler aus Hall of Fame injizieren (n+5) -------------------
-        if self.hall.entries:
-            num_guests = min(5, len(self.hall.entries))
-            # Wähle die 5 besten (neuesten) Einträge oder zufällig
-            # Da wir die "Besten" wollen, nehmen wir sie sortiert nach Fitness oder einfach die letzen 5
-            # sorted_entries = sorted(self.hall.entries, key=lambda e: e.fitness, reverse=True)
-            # Wir nehmen der Einfachheit halber bis zu 5 zufällige oder die Top 5
-            top_entries = sorted(self.hall.entries, key=lambda e: e.fitness, reverse=True)[:num_guests]
-            
-            for guest_entry in top_entries:
-                try:
-                    guest_genome = pickle.loads(guest_entry.genome_data)
-                    # Prüfe ob Genom kompatibel ist (gleiche Input-Anzahl)
-                    expected_inputs = self.sim_config.sensor_ray_count * 5 + 1
-                    guest_neat_net = neat.nn.FeedForwardNetwork.create(guest_genome, self.collector_config)
-                    test_input = [0.0] * expected_inputs
-                    guest_neat_net.activate(test_input)  # Test ob es funktioniert
-                    guest_fast_net = FastNetwork(guest_neat_net)  # JIT-kompiliert
+        # --- Hall of Fame Gaeste hinzufuegen ---
+        live_guests = self.hall.entries[:5]
+        for entry in live_guests:
+            try:
+                loaded_genome = self.hall.get_genome(entry)
+                loaded_genome.is_guest = True
+                net = FastNetwork(neat.nn.FeedForwardNetwork.create(loaded_genome, self.collector_config))
+                c = Collector(*self.world.spawn_robot_position(), self.sim_config)
+                
+                c.color = (0, 255, 255)  # Cyan
+                c.is_guest = True
+                c.is_injected = True
+                c.hof_name = entry.name
+                c.genome = loaded_genome
+                
+                collectors.append(c)
+                collector_nets.append(net)
+                collector_genome_list.append(loaded_genome)
+            except Exception as e:
+                print(f"[NEAT] Fehler beim Laden von Gast {entry.name}: {e}")
 
-                    guest_genome.fitness = 0.0
-                    guest_genome.is_guest = True
-                    guest_genome.is_injected = True
-                    x, y = world.spawn_robot_position()
-                    c = Collector(x, y, self.sim_config)
-                    c.genome = guest_genome
-                    c.net = guest_fast_net
-                    c.is_injected = True
-                    collectors.append(c)
-                    collector_genome_list.append(guest_genome)
-                    collector_nets.append(guest_fast_net)
-                except Exception as e:
-                    print(f"[NEAT] Gast-Roboter uebersprungen (inkompatibel): {e}")
+
+        print(f"[NEAT] --- Generation {self.generation} startet ---")
+        guest_names = [getattr(c, 'hof_name', 'Unknown') for c in collectors if getattr(c, 'is_guest', False)]
+        if guest_names:
+            print(f"[NEAT] {len(guest_names)} Hall of Fame Gaeste im Spielfeld: {', '.join(guest_names)}")
+        
+        expected_total = self.sim_config.collector_pop_size + len(live_guests)
+        if len(collectors) == expected_total:
+            print(f"[NEAT] SICHERHEITSCHECK OK: Roboteranzahl ist korrekt erhoeht auf {len(collectors)}.")
+        else:
+            print(f"[NEAT] SICHERHEITSCHECK FEHLGESCHLAGEN! Erwartet: {expected_total}, Aktuell: {len(collectors)}.")
 
         # --- Jaeger erstellen --------------------------------------------------
         hunter_genomes = list(self.hunter_pop.population.items())
@@ -295,6 +324,13 @@ class CoEvolutionManager:
         total_frames = self.sim_config.simulation_frames
         current_step = 0
         gen_start_time = time.time()
+        collector_sees_hunter_frames = 0
+        collector_danger_frames = 0
+        collector_escape_events = 0
+        collector_approach_events = 0
+        collector_neutral_events = 0
+        nearest_hunter_dist_sum = 0.0
+        nearest_hunter_dist_count = 0
 
         # Initiale Speed-Anzeige
         if self.stats_graph:
@@ -316,7 +352,7 @@ class CoEvolutionManager:
                         print("[NEAT] Turbo AUS (Visualisierung)")
                     elif cmd == "open_brain_viewer":
                         num_in = self.sim_config.sensor_ray_count * 5 + 1
-                        viewer = BrainViewerWindow(self.hall, num_inputs=num_in, num_outputs=3)
+                        viewer = BrainViewerWindow(self.hall, num_inputs=num_in, num_outputs=2)
                         viewer.start()
                     elif cmd == "toggle_sensors":
                         show_sensors = not show_sensors
@@ -368,7 +404,10 @@ class CoEvolutionManager:
             eaten_penalty = self.sim_config.fitness_eaten_penalty
             energy_refill = self.sim_config.energy_start
             bat_proximity_bonus = self.sim_config.fitness_battery_proximity
-            hunter_danger_penalty = self.sim_config.fitness_hunter_danger
+            hunter_danger_penalty = max(self.sim_config.fitness_hunter_danger, 0.15)
+            hunter_approach_penalty = max(
+                getattr(self.sim_config, 'fitness_hunter_approach_penalty', 15.0),
+                15.0)
             danger_zone = self.sim_config.fitness_danger_zone
             danger_zone_sq = danger_zone * danger_zone  # Vermeidet sqrt!
 
@@ -387,26 +426,11 @@ class CoEvolutionManager:
                     if b.active:
                         grid.insert(b)
 
-                # --- Radio-Signale verarbeiten --------------------------------
-                radio_range = self.sim_config.radio_range
-                for r in all_robots:
-                    if not r.alive:
-                        continue
-                    # Alle anderen Roboter im Umkreis finden
-                    nearby = grid.get_nearby(r, radio_range)
-                    # Maximales Funksignal der lebenden Nachbarn ermitteln
-                    max_signal = 0.0
-                    for nr in nearby:
-                        # Nur Signale der eigenen Art (Collector->Collector oder Hunter->Hunter)
-                        if nr.entity_type == r.entity_type and nr is not r and nr.alive:
-                            if nr.radio_out > max_signal:
-                                max_signal = nr.radio_out
-                    r.radio_in = max_signal
+                # --- Radio-Signale verarbeiten (Deaktiviert zur Rauschreduzierung) ---
 
-                # Sensoren nur jeden 4. Frame im Turbo aktualisieren
-                # (viertelt die teuerste Berechnung - 244M Ray-Checks/Gen)
+                # Sensoren nur jeden 2. Frame im Turbo aktualisieren (fuer bessere Reaktionszeiten)
                 # Positionsfehler ist minimal: Roboter bewegen sich nur ~3px/Frame
-                update_sensors_flag = (not training_mode) or (step_i % 4 == 0)
+                update_sensors_flag = (not training_mode) or (step_i % 2 == 0)
 
                 # --- Sensoren: Parallel (Turbo) oder Einzeln (Normal) ---------
                 if update_sensors_flag:
@@ -440,21 +464,39 @@ class CoEvolutionManager:
                     if not c.alive:
                         continue
 
+                    # NEU: Direkte Gefahr-Inputs (Nearest Hunter) vorbereiten
+                    search_radius = self.sim_config.collector_sensor_ray_length
+                    nearby_hunters_for_input = grid.get_nearby(c, search_radius)
+                    nearest_dist = search_radius
+                    nearest_hunter = None
+                    for h_ in nearby_hunters_for_input:
+                        if h_.entity_type == ENTITY_HUNTER and h_.alive:
+                            dx = h_.x - c.x
+                            dy = h_.y - c.y
+                            dsq = dx * dx + dy * dy
+                            if dsq < nearest_dist * nearest_dist:
+                                nearest_dist = dsq ** 0.5
+                                nearest_hunter = h_
+                                
+                    dx_norm = 0.0
+                    dy_norm = 0.0
+                    if nearest_hunter:
+                        dist_norm = 1.0 - (nearest_dist / search_radius)
+                        angle_to_hunter = math.atan2(nearest_hunter.y - c.y, nearest_hunter.x - c.x)
+                        rel_angle = angle_to_hunter - c.angle
+                        dx_norm = math.cos(rel_angle) * dist_norm
+                        dy_norm = math.sin(rel_angle) * dist_norm
+                        
                     # Neuronales Netz
                     if not c.sensor_data:  # Noch keine Sensordaten -> Skip
                         continue
                     inputs = c.get_sensor_inputs()
+                    inputs.append(dx_norm)
+                    inputs.append(dy_norm)
                     output = collector_nets[i].activate(inputs)
                     
-                    radio = output[2] if len(output) > 2 else 0.0
-                    
-                    # Hard-Clamp: Ein Roboter KANN NUR schreien, wenn er einen Jäger direkt sieht.
-                    # Verhindert Kettenreaktionen (Flüsterpost), bei der alle schreien ohne Grund.
-                    sees_hunter = any(obj_type == 4 for _, obj_type, _, _ in c.sensor_data)
-                    if not sees_hunter:
-                        radio = 0.0
-
-                    c.move(output[0], output[1], radio)
+                    # Motor Control (Funk deaktiviert)
+                    c.move(output[0], output[1])
                     c.clamp_to_bounds(w_width, w_height)
                     c.check_obstacle_collision_fast(obstacles_tuples)
 
@@ -509,6 +551,7 @@ class CoEvolutionManager:
                         c.prev_hunter_dists = {}
                     
                     current_hunter_dists = {}
+                    nearest_hunter_dist = None
                     
                     for nh in nearby_hunters:
                         if nh.entity_type == ENTITY_HUNTER and nh.alive:
@@ -517,19 +560,39 @@ class CoEvolutionManager:
                             dsq = dx * dx + dy * dy
                             if dsq < danger_zone_sq:
                                 d = dsq ** 0.5
+                                collector_danger_frames += 1
+                                if nearest_hunter_dist is None or d < nearest_hunter_dist:
+                                    nearest_hunter_dist = d
                                 current_hunter_dists[id(nh)] = d
+                                danger_penalty = hunter_danger_penalty * (1.0 - d / danger_zone)
+                                if danger_penalty > 0.0:
+                                    collector_genome_list[i].fitness -= danger_penalty
+                                    c.fit_hunter_pen -= danger_penalty
                                 
                                 # Escape Bonus: If we moved further away from this hunter since last frame
                                 if id(nh) in c.prev_hunter_dists:
                                     prev_d = c.prev_hunter_dists[id(nh)]
                                     dist_delta = d - prev_d
                                     if dist_delta > 0:  # Moving away!
+                                        collector_escape_events += 1
                                         # Bonus proportional to how fast we are escaping (max collector_speed)
-                                        # DRSTISCH ERHÖHTER FLUCHTBONUS: 5.0 statt 0.5, damit Fliehen das Lukrativste überhaupt wird!
-                                        escape_bonus = (dist_delta / self.sim_config.collector_speed) * 5.0
+                                        # DRSTISCH ERHÖHTER FLUCHTBONUS: 15.0 statt 5.0, damit Fliehen extrem lukrativ wird!
+                                        escape_bonus = (dist_delta / self.sim_config.collector_speed) * 15.0
                                         collector_genome_list[i].fitness += escape_bonus
-                                        c.fit_surv += escape_bonus # Dem Survival-Score im Log zuschlagen
+                                        c.fit_escape += escape_bonus
+                                    elif dist_delta < 0:
+                                        collector_approach_events += 1
+                                        approach_penalty = ((-dist_delta / self.sim_config.collector_speed) *
+                                                            hunter_approach_penalty)
+                                        collector_genome_list[i].fitness -= approach_penalty
+                                        c.fit_approach -= approach_penalty
+                                    else:
+                                        collector_neutral_events += 1
                                         
+                    if nearest_hunter_dist is not None:
+                        nearest_hunter_dist_sum += nearest_hunter_dist
+                        nearest_hunter_dist_count += 1
+
                     # Update previous distances for next frame
                     c.prev_hunter_dists = current_hunter_dists
 
@@ -538,20 +601,39 @@ class CoEvolutionManager:
                     if not h.alive:
                         continue
 
+                    # NEU: Direkte Beute-Inputs (Nearest Collector) vorbereiten
+                    search_radius = self.sim_config.hunter_sensor_ray_length
+                    nearby_collectors_for_input = grid.get_nearby(h, search_radius)
+                    nearest_dist = search_radius
+                    nearest_collector = None
+                    for prey in nearby_collectors_for_input:
+                        if prey.entity_type == ENTITY_COLLECTOR and prey.alive:
+                            dx = prey.x - h.x
+                            dy = prey.y - h.y
+                            dsq = dx * dx + dy * dy
+                            if dsq < nearest_dist * nearest_dist:
+                                nearest_dist = dsq ** 0.5
+                                nearest_collector = prey
+                                
+                    dx_norm = 0.0
+                    dy_norm = 0.0
+                    if nearest_collector:
+                        dist_norm = 1.0 - (nearest_dist / search_radius)
+                        angle_to_collector = math.atan2(nearest_collector.y - h.y, nearest_collector.x - h.x)
+                        rel_angle = angle_to_collector - h.angle
+                        dx_norm = math.cos(rel_angle) * dist_norm
+                        dy_norm = math.sin(rel_angle) * dist_norm
+                        
                     # Neuronales Netz
                     if not h.sensor_data:  # Noch keine Sensordaten -> Skip
                         continue
                     inputs = h.get_sensor_inputs()
+                    inputs.append(dx_norm)
+                    inputs.append(dy_norm)
                     output = hunter_nets[i].activate(inputs)
                     
-                    radio = output[2] if len(output) > 2 else 0.0
-                    
-                    # Hard-Clamp: Jäger schreien nur, wenn sie Beute (Sammler) sehen.
-                    sees_collector = any(obj_type == 3 for _, obj_type, _, _ in h.sensor_data)
-                    if not sees_collector:
-                        radio = 0.0
-                        
-                    h.move(output[0], output[1], radio)
+                    # Motor Control (Funk deaktiviert)
+                    h.move(output[0], output[1])
                     h.clamp_to_bounds(w_width, w_height)
                     h.check_obstacle_collision_fast(obstacles_tuples)
 
@@ -651,10 +733,12 @@ class CoEvolutionManager:
         avg_fit_prox = sum(c.fit_prox for c in real_collectors) / len(real_collectors) if real_collectors else 0
         avg_fit_surv = sum(c.fit_surv for c in real_collectors) / len(real_collectors) if real_collectors else 0
         avg_fit_pen = sum(c.fit_hunter_pen for c in real_collectors) / len(real_collectors) if real_collectors else 0
+        avg_fit_escape = sum(c.fit_escape for c in real_collectors) / len(real_collectors) if real_collectors else 0
+        avg_fit_approach = sum(c.fit_approach for c in real_collectors) / len(real_collectors) if real_collectors else 0
         avg_fit_death = sum(c.fit_death for c in real_collectors) / len(real_collectors) if real_collectors else 0
         avg_fit_idle = sum(c.fit_idle for c in real_collectors) / len(real_collectors) if real_collectors else 0
         
-        print(f"[FITNESS BREAKDOWN AVG] Bat: {avg_fit_bat:.1f} | Prox: {avg_fit_prox:.1f} | Surv: {avg_fit_surv:.1f} | Pen: {avg_fit_pen:.1f} | Death: {avg_fit_death:.1f} | Idle: {avg_fit_idle:.1f}")
+        print(f"[FITNESS BREAKDOWN AVG] Bat: {avg_fit_bat:.1f} | Prox: {avg_fit_prox:.1f} | Surv: {avg_fit_surv:.1f} | Pen: {avg_fit_pen:.1f} | Escape: {avg_fit_escape:.1f} | Approach: {avg_fit_approach:.1f} | Death: {avg_fit_death:.1f} | Idle: {avg_fit_idle:.1f}")
 
         total_kills = sum(h.kills for h in hunters)
         total_bats = sum(c.batteries_collected for c in collectors)
@@ -664,6 +748,56 @@ class CoEvolutionManager:
               f"Sammler best={self.best_collector_fitness:.1f} avg={self.avg_collector_fitness:.1f} | "
               f"Jaeger best={self.best_hunter_fitness:.1f} avg={self.avg_hunter_fitness:.1f} | "
               f"Kills={total_kills} Batt={total_bats} Alive={alive_collectors}")
+
+        gen_duration = time.time() - gen_start_time
+        movement_events = (collector_escape_events + collector_approach_events +
+                           collector_neutral_events)
+        escape_ratio = (collector_escape_events / movement_events
+                        if movement_events else 0.0)
+        approach_ratio = (collector_approach_events / movement_events
+                          if movement_events else 0.0)
+        avg_nearest_hunter_dist = (nearest_hunter_dist_sum / nearest_hunter_dist_count
+                                   if nearest_hunter_dist_count else 0.0)
+        injected_collectors = [c for c in collectors if c.is_injected]
+        real_bats = sum(c.batteries_collected for c in real_collectors)
+
+        _append_csv_row(self.generation_log_path, GENERATION_LOG_FIELDS, {
+            "run_id": self.run_id,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "generation": self.generation,
+            "duration_sec": f"{gen_duration:.4f}",
+            "training_mode": int(training_mode),
+            "speed_multiplier": speed_multiplier,
+            "collectors_total": len(collectors),
+            "collectors_real": len(real_collectors),
+            "collectors_injected": len(injected_collectors),
+            "collectors_alive": alive_collectors,
+            "hunters_total": len(hunters),
+            "hunters_alive": sum(1 for h in hunters if h.alive),
+            "batteries_collected": total_bats,
+            "batteries_collected_real": real_bats,
+            "kills": total_kills,
+            "best_collector_fitness": f"{self.best_collector_fitness:.6f}",
+            "avg_collector_fitness": f"{self.avg_collector_fitness:.6f}",
+            "best_hunter_fitness": f"{self.best_hunter_fitness:.6f}",
+            "avg_hunter_fitness": f"{self.avg_hunter_fitness:.6f}",
+            "avg_fit_battery": f"{avg_fit_bat:.6f}",
+            "avg_fit_proximity": f"{avg_fit_prox:.6f}",
+            "avg_fit_survival": f"{avg_fit_surv:.6f}",
+            "avg_fit_hunter_penalty": f"{avg_fit_pen:.6f}",
+            "avg_fit_escape": f"{avg_fit_escape:.6f}",
+            "avg_fit_approach": f"{avg_fit_approach:.6f}",
+            "avg_fit_death": f"{avg_fit_death:.6f}",
+            "avg_fit_idle": f"{avg_fit_idle:.6f}",
+            "collector_sees_hunter_frames": collector_sees_hunter_frames,
+            "collector_danger_frames": collector_danger_frames,
+            "collector_escape_events": collector_escape_events,
+            "collector_approach_events": collector_approach_events,
+            "collector_neutral_events": collector_neutral_events,
+            "escape_ratio": f"{escape_ratio:.6f}",
+            "approach_ratio": f"{approach_ratio:.6f}",
+            "avg_nearest_hunter_dist": f"{avg_nearest_hunter_dist:.6f}",
+        })
 
         # --- Hall of Fame (beste Sammler) -------------------------------------
         if c_fits:
@@ -714,7 +848,8 @@ class CoEvolutionManager:
                 alive=alive_collectors,
                 total_collectors=len(collectors),
                 batteries=total_bats,
-                gen_time=gen_duration)
+                gen_time=gen_duration,
+                escape_ratio=escape_ratio)
 
         # --- Naechste Generation ----------------------------------------------
         # Sammler
