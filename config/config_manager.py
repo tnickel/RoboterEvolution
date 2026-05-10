@@ -53,37 +53,37 @@ class SimConfig:
     battery_energy: float = 30.0     # Energie pro aufgesammelter Batterie
 
     # ── Energie ──
-    energy_start: float = 100.0      # Start-Energie jedes Roboters
-    energy_drain_per_frame: float = 0.04  # Energieverlust pro Frame (100/0.04 = 2500 Frames Basis-Ueberlebenszeit)
+    energy_start: float = 50.0       # Start-Energie jedes Roboters (Halbiert, erzwingt sofortiges Handeln)
+    energy_drain_per_frame: float = 0.08  # Energieverlust pro Frame (Verdoppelt, Stillstand = Tod)
     energy_death_threshold: float = 0.0  # Tod bei diesem Wert
 
     # ── Roboter ──
-    collector_speed: float = 3.5     # Geschwindigkeit Sammler (Schneller zur Flucht)
-    hunter_speed: float = 3.0        # Geschwindigkeit Jäger (Langsamer, muss strategisch jagen)
+    collector_speed: float = 4.5     # Geschwindigkeit Sammler (Deutlich schneller zur Flucht)
+    hunter_speed: float = 3.8        # Geschwindigkeit Jäger (Aggressiver, erzwingt Fluchtreflex)
     robot_radius: float = 18.0       # Kollisionsradius Roboter
     sensor_ray_count: int = 5        # Anzahl Sensor-Strahlen (5 reichen mit klaren Inputs)
-    collector_sensor_ray_length: float = 300.0 # Sammler sehen weiter (Fluchtvorteil)
-    collector_sensor_fov: float = 120.0        # Sammler haben weiteres Sichtfeld
+    collector_sensor_ray_length: float = 400.0 # Sammler sehen sehr weit (maximale Vorwarnzeit)
+    collector_sensor_fov: float = 240.0        # Sammler haben seeehr weites Sichtfeld (peripheres Sehen)
     hunter_sensor_ray_length: float = 200.0    # Jäger sind kurzsichtiger
     hunter_sensor_fov: float = 90.0            # Jäger haben Tunnelblick
-    radio_range: float = 300.0                 # Reichweite der Kommunikation (Antenne)
+    radio_range: float = 200.0                 # Reichweite der Kommunikation (Antenne)
 
     # ── NEAT ──
-    collector_pop_size: int = 100    # Populationsgröße Sammler
-    hunter_pop_size: int = 10        # Populationsgröße Jäger (stark reduziert für bessere Balance)
+    collector_pop_size: int = 50     # Populationsgröße Sammler
+    hunter_pop_size: int = 10        # Populationsgröße Jäger (Wieder reduziert, damit Sammler atmen können)
     simulation_frames: int = 2500    # Frames pro Evaluierung (laenger = besseres Ueberlebens-Signal)
 
     # ── Fitness ──
     fitness_battery_collected: float = 100.0  # Punkte pro Batterie (stark erhöht: klares Hauptziel)
-    fitness_idle_penalty: float = -0.02       # Strafe pro Frame (nur bei echtem Herumstehen)
-    fitness_survival_bonus: float = 0.01      # Bonus pro überlebtem Frame
+    fitness_idle_penalty: float = -0.2        # MASSIVE Strafe pro Frame (Bestraft Kreisdreher extrem!)
+    fitness_survival_bonus: float = 0.5       # MASSIVER Bonus pro überlebtem Frame (Belohnt Flucht & Überleben!)
     fitness_hunter_kill: float = 200.0        # Punkte pro gefangenem Sammler
-    fitness_eaten_penalty: float = -2000.0    # EXTREME Strafe wenn gefressen (Überleben > alles!)
+    fitness_eaten_penalty: float = -10000.0   # EXTREME Strafe wenn gefressen (Überleben > alles!)
 
     # ── Fitness-Gradient (Proximity) ──
     fitness_battery_proximity: float = 0.1   # Bonus/Frame wenn nahe an Batterie (Gradient zum Futter)
-    fitness_hunter_danger: float = 0.5       # Hohe Strafe/Frame wenn nahe an Jäger (Flucht-Reflex!)
-    fitness_danger_zone: float = 200.0       # Radius der Gefahrenzone um Jäger (Pixel)
+    fitness_hunter_danger: float = 0.0       # KEINE STRAFE mehr für bloße Nähe! (Nur der Tod bestraft)
+    fitness_danger_zone: float = 200.0       # Radius der Gefahrenzone (Reduziert auf 200, um Phantom-Panik zu vermeiden)
 
     @property
     def window_width(self) -> int:

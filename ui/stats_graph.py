@@ -208,7 +208,11 @@ class StatsGraphWindow:
 
         btn_sensors = tk.Button(ctrl_frame, text="Strahlen Ein/Aus", command=lambda: self._send_command("toggle_sensors"),
                                 bg="#00C878", fg="black", font=("Segoe UI", 12, "bold"), relief=tk.FLAT, padx=15, pady=5)
-        btn_sensors.pack(side=tk.LEFT, padx=20)
+        btn_sensors.pack(side=tk.LEFT, padx=10)
+
+        btn_radio = tk.Button(ctrl_frame, text="Funk Ein/Aus", command=lambda: self._send_command("toggle_radio"),
+                              bg="#64C8FF", fg="black", font=("Segoe UI", 12, "bold"), relief=tk.FLAT, padx=15, pady=5)
+        btn_radio.pack(side=tk.LEFT, padx=10)
 
         # Polling starten
         self._poll_data()

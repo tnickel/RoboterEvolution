@@ -14,6 +14,12 @@ import pygame
 from config.config_manager import SimConfig
 
 
+# ─── Entity-Typ-Konstanten (ersetzt isinstance() in Hot-Loops) ──────────────────
+ENTITY_BATTERY = 0
+ENTITY_COLLECTOR = 1
+ENTITY_HUNTER = 2
+
+
 # ─── Farb-Konstanten ────────────────────────────────────────────────────────────
 COLOR_BATTERY_ACTIVE = (255, 230, 50)
 COLOR_BATTERY_GLOW = (255, 255, 100, 80)
@@ -46,6 +52,7 @@ class Battery:
         self.active = True
         self.respawn_timer = 0
         self.glow_phase = random.uniform(0, math.pi * 2)  # Für Glow-Animation
+        self.entity_type = ENTITY_BATTERY  # Typ-Flag für schnelle Abfragen
 
     def collect(self) -> None:
         """Markiert die Batterie als eingesammelt und startet den Respawn-Timer."""
@@ -168,6 +175,15 @@ class Robot:
         # Funk-Antenne (Stufe 5)
         self.radio_out = 0.0
         self.radio_in = 0.0
+        self.entity_type = -1  # Wird von Subklassen gesetzt
+        
+        # Fitness-Tracking fuer Debugging/Analytics
+        self.fit_battery = 0.0
+        self.fit_prox = 0.0
+        self.fit_hunter_pen = 0.0
+        self.fit_death = 0.0
+        self.fit_surv = 0.0
+        self.fit_idle = 0.0
 
     def update_sensors(self, walls: list, batteries: list, robots: list) -> None:
         """Aktualisiert die Sensordaten durch Raycasting.
@@ -190,16 +206,18 @@ class Robot:
             Liste mit [dist, is_battery, is_hunter, is_wall, is_collector] pro Strahl,
             plus 1 Wert für das empfangene Funksignal am Ende.
         """
-        inputs = []
+        n = len(self.sensor_data)
+        inputs = [0.0] * (n * 5 + 1)  # Pre-allokiert statt append()
+        idx = 0
         for dist_norm, obj_type, _, _ in self.sensor_data:
-            inputs.append(dist_norm)
-            inputs.append(1.0 if obj_type == 2 else 0.0)  # Batterie?
-            inputs.append(1.0 if obj_type == 4 else 0.0)  # Jäger? (GEFAHR!)
-            inputs.append(1.0 if obj_type == 1 else 0.0)  # Wand?
-            inputs.append(1.0 if obj_type == 3 else 0.0)  # Sammler? (Schwarm!)
-            
+            inputs[idx] = dist_norm
+            inputs[idx + 1] = 1.0 if obj_type == 2 else 0.0  # Batterie?
+            inputs[idx + 2] = 1.0 if obj_type == 4 else 0.0  # Jäger? (GEFAHR!)
+            inputs[idx + 3] = 1.0 if obj_type == 1 else 0.0  # Wand?
+            inputs[idx + 4] = 1.0 if obj_type == 3 else 0.0  # Sammler? (Schwarm!)
+            idx += 5
         # Funksignal als globalen Input anhängen
-        inputs.append(self.radio_in)
+        inputs[idx] = self.radio_in
         return inputs
 
     def move(self, left_motor: float, right_motor: float, radio_out: float = 0.0, dt: float = 1.0) -> None:
@@ -263,6 +281,56 @@ class Robot:
             self.y = margin
         elif self.y > height - margin:
             self.y = height - margin
+
+    def check_obstacle_collision_fast(self, obstacles_tuples: list[tuple[float, float, float, float]]) -> None:
+        """Prüft und korrigiert Kollision mit Hindernissen (Performance-optimiert).
+
+        Schiebt den Roboter aus überlappenden Hindernissen heraus.
+        Nutzt vorberechnete Tupel (left, top, right, bottom) und if/else statt min/max
+        um Millionen von Funktionsaufrufen zu sparen.
+
+        Args:
+            obstacles_tuples: Liste der Hindernisse als (left, top, right, bottom).
+        """
+        r_sq = self.radius * self.radius
+        rx = self.x
+        ry = self.y
+        
+        for left, top, right, bottom in obstacles_tuples:
+            # Schneller Inline-Ersatz für:
+            # closest_x = max(left, min(rx, right))
+            # closest_y = max(top, min(ry, bottom))
+            if rx < left:
+                closest_x = left
+            elif rx > right:
+                closest_x = right
+            else:
+                closest_x = rx
+                
+            if ry < top:
+                closest_y = top
+            elif ry > bottom:
+                closest_y = bottom
+            else:
+                closest_y = ry
+                
+            dx = rx - closest_x
+            dy = ry - closest_y
+            dist_sq = dx * dx + dy * dy
+
+            if dist_sq < r_sq:
+                # Kollision! Roboter herausschieben
+                dist = math.sqrt(dist_sq) if dist_sq > 0 else 0.01
+                overlap = self.radius - dist
+                if dist > 0:
+                    rx += (dx / dist) * overlap
+                    ry += (dy / dist) * overlap
+                else:
+                    rx += overlap
+                    ry += overlap
+                    
+        self.x = rx
+        self.y = ry
 
     def check_obstacle_collision(self, obstacles: list[pygame.Rect]) -> None:
         """Prüft und korrigiert Kollision mit Hindernissen.
@@ -352,6 +420,7 @@ class Collector(Robot):
         super().__init__(x, y, config, color=COLOR_COLLECTOR)
         self.speed = config.collector_speed
         self.batteries_collected = 0
+        self.entity_type = ENTITY_COLLECTOR
 
 
 class Hunter(Robot):
@@ -365,3 +434,16 @@ class Hunter(Robot):
         super().__init__(x, y, config, color=COLOR_HUNTER)
         self.speed = config.hunter_speed
         self.kills = 0
+        self.entity_type = ENTITY_HUNTER
+
+    def drain_energy(self) -> None:
+        """Jäger verbrauchen Energie, sterben aber nie daran.
+        
+        So bleiben sie als Konstante Gefahrenquelle erhalten,
+        damit die Sammler durchgehend einen Fluchtdruck haben.
+        """
+        if not self.alive:
+            return
+        self.energy -= self.config.energy_drain_per_frame
+        if self.energy <= self.config.energy_death_threshold:
+            self.energy = self.config.energy_death_threshold + 1.0

@@ -1,6 +1,6 @@
 # NEAT-Konfiguration fuer Jaeger-Population (Neuro-Oekosystem)
-# Inputs:  10 (5 Distanzen + 5 Objekttypen, normalisiert)
-# Outputs:  2 (Motor links, Motor rechts)
+# Inputs:  26 (5 Strahlen * 5 Werte + 1 Radio)
+# Outputs:  3 (Motor links, Motor rechts, Radio-Signal)
 # Hoehere Mutationsraten fuer aggressivere Evolution
 
 [NEAT]
@@ -12,8 +12,8 @@ no_fitness_termination = False
 
 [DefaultGenome]
 feed_forward            = True
-num_inputs              = 10
-num_outputs             = 2
+num_inputs              = 26
+num_outputs             = 3
 num_hidden              = 0
 
 activation_default      = tanh
@@ -32,10 +32,10 @@ bias_mutate_power       = 0.6
 bias_mutate_rate        = 0.75
 bias_replace_rate       = 0.1
 
-conn_add_prob           = 0.6
-conn_delete_prob        = 0.5
-node_add_prob           = 0.3
-node_delete_prob        = 0.2
+conn_add_prob           = 0.8
+conn_delete_prob        = 0.3
+node_add_prob           = 0.7
+node_delete_prob        = 0.1
 
 compatibility_disjoint_coefficient = 1.0
 compatibility_weight_coefficient   = 0.5

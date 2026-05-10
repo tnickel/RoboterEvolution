@@ -18,9 +18,10 @@ import neat
 import pygame
 from config.config_manager import SimConfig
 from core.world import World
-from core.entities import Collector, Hunter, Battery
+from core.entities import Collector, Hunter, Battery, ENTITY_BATTERY, ENTITY_COLLECTOR, ENTITY_HUNTER
 from core.sensors import draw_sensors, cast_rays_batch
 from core.spatial_grid import SpatialGrid
+from core.fast_net import FastNetwork
 from ai.hall_of_fame import HallOfFame, HallOfFameEntry
 from ui.commentary import CommentaryWindow
 from ui.stats_graph import StatsGraphWindow
@@ -184,19 +185,20 @@ class CoEvolutionManager:
 
     def run_generation(self, screen: pygame.Surface | None,
                        clock: pygame.time.Clock,
-                       show_sensors: bool, training_mode: bool,
-                       speed_multiplier: int) -> tuple[bool, bool, bool, int]:
+                       show_sensors: bool, show_radio: bool, training_mode: bool,
+                       speed_multiplier: int) -> tuple[bool, bool, bool, bool, int]:
         """Fuehrt eine Generation der Co-Evolution durch.
 
         Args:
             screen: Pygame-Screen (None = kein Rendering)
             clock: Pygame-Clock
             show_sensors: Ob Sensoren gezeichnet werden
+            show_radio: Ob Radio-Funkwellen gezeichnet werden
             training_mode: Ob im schnellen Training-Modus
             speed_multiplier: Simulationsschritte pro Frame
 
         Returns:
-            Tuple (continue, show_sensors, training_mode, speed_multiplier)
+            Tuple (continue, show_sensors, show_radio, training_mode, speed_multiplier)
             continue=False wenn Benutzer beendet hat.
         """
         # --- Welt: Wiederverwenden oder alle N Generationen erneuern ----------
@@ -208,7 +210,7 @@ class CoEvolutionManager:
         for b in world.batteries:
             b.active = True
             b.respawn_timer = 0
-        grid = SpatialGrid(cell_size=100)
+        grid = SpatialGrid(cell_size=150)
 
         # --- Sammler erstellen -------------------------------------------------
         collector_genomes = list(self.collector_pop.population.items())
@@ -218,7 +220,8 @@ class CoEvolutionManager:
 
         for genome_id, genome in collector_genomes:
             genome.fitness = 0.0
-            net = neat.nn.FeedForwardNetwork.create(genome, self.collector_config)
+            neat_net = neat.nn.FeedForwardNetwork.create(genome, self.collector_config)
+            net = FastNetwork(neat_net)  # JIT-kompiliertes Netz (10-20x schneller)
             x, y = world.spawn_robot_position()
             c = Collector(x, y, self.sim_config)
             c.genome = genome
@@ -242,9 +245,10 @@ class CoEvolutionManager:
                     guest_genome = pickle.loads(guest_entry.genome_data)
                     # Prüfe ob Genom kompatibel ist (gleiche Input-Anzahl)
                     expected_inputs = self.sim_config.sensor_ray_count * 5 + 1
-                    guest_net_test = neat.nn.FeedForwardNetwork.create(guest_genome, self.collector_config)
+                    guest_neat_net = neat.nn.FeedForwardNetwork.create(guest_genome, self.collector_config)
                     test_input = [0.0] * expected_inputs
-                    guest_net_test.activate(test_input)  # Test ob es funktioniert
+                    guest_neat_net.activate(test_input)  # Test ob es funktioniert
+                    guest_fast_net = FastNetwork(guest_neat_net)  # JIT-kompiliert
 
                     guest_genome.fitness = 0.0
                     guest_genome.is_guest = True
@@ -252,11 +256,11 @@ class CoEvolutionManager:
                     x, y = world.spawn_robot_position()
                     c = Collector(x, y, self.sim_config)
                     c.genome = guest_genome
-                    c.net = guest_net_test
+                    c.net = guest_fast_net
                     c.is_injected = True
                     collectors.append(c)
                     collector_genome_list.append(guest_genome)
-                    collector_nets.append(guest_net_test)
+                    collector_nets.append(guest_fast_net)
                 except Exception as e:
                     print(f"[NEAT] Gast-Roboter uebersprungen (inkompatibel): {e}")
 
@@ -268,7 +272,8 @@ class CoEvolutionManager:
 
         for genome_id, genome in hunter_genomes:
             genome.fitness = 0.0
-            net = neat.nn.FeedForwardNetwork.create(genome, self.hunter_config)
+            neat_net = neat.nn.FeedForwardNetwork.create(genome, self.hunter_config)
+            net = FastNetwork(neat_net)  # JIT-kompiliertes Netz
             x, y = world.spawn_robot_position()
             h = Hunter(x, y, self.sim_config)
             h.genome = genome
@@ -315,16 +320,20 @@ class CoEvolutionManager:
                         viewer.start()
                     elif cmd == "toggle_sensors":
                         show_sensors = not show_sensors
+                    elif cmd == "toggle_radio":
+                        show_radio = not show_radio
 
             # Pygame Events
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
-                    return (False, show_sensors, training_mode, speed_multiplier)
+                    return (False, show_sensors, show_radio, training_mode, speed_multiplier)
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
-                        return (False, show_sensors, training_mode, speed_multiplier)
+                        return (False, show_sensors, show_radio, training_mode, speed_multiplier)
                     elif event.key == pygame.K_s:
                         show_sensors = not show_sensors
+                    elif event.key == pygame.K_f:
+                        show_radio = not show_radio
                     elif event.key == pygame.K_t:
                         training_mode = not training_mode
                         print(f"[NEAT] Modus: {'Training' if training_mode else 'Visualisierung'}")
@@ -349,6 +358,7 @@ class CoEvolutionManager:
             hunter_sensor_range = self.sim_config.hunter_sensor_ray_length
             walls = world.walls
             obstacles = world.obstacles
+            obstacles_tuples = [(float(obs.left), float(obs.top), float(obs.right), float(obs.bottom)) for obs in obstacles]
             w_width = world.width
             w_height = world.height
             idle_penalty = self.sim_config.fitness_idle_penalty
@@ -360,6 +370,10 @@ class CoEvolutionManager:
             bat_proximity_bonus = self.sim_config.fitness_battery_proximity
             hunter_danger_penalty = self.sim_config.fitness_hunter_danger
             danger_zone = self.sim_config.fitness_danger_zone
+            danger_zone_sq = danger_zone * danger_zone  # Vermeidet sqrt!
+
+            # Pre-built Index-Lookup: Collector -> Genome-Index (O(1) statt O(N))
+            collector_idx_map = {id(c): i for i, c in enumerate(collectors)}
 
             for step_i in range(steps):
                 current_step += 1
@@ -383,14 +397,16 @@ class CoEvolutionManager:
                     # Maximales Funksignal der lebenden Nachbarn ermitteln
                     max_signal = 0.0
                     for nr in nearby:
-                        if isinstance(nr, (Collector, Hunter)) and nr is not r and nr.alive:
+                        # Nur Signale der eigenen Art (Collector->Collector oder Hunter->Hunter)
+                        if nr.entity_type == r.entity_type and nr is not r and nr.alive:
                             if nr.radio_out > max_signal:
                                 max_signal = nr.radio_out
                     r.radio_in = max_signal
 
-                # Sensoren nur jeden 2. Frame im Turbo aktualisieren
-                # (halbiert die teuerste Berechnung - Raycasting)
-                update_sensors_flag = (not training_mode) or (step_i % 2 == 0)
+                # Sensoren nur jeden 4. Frame im Turbo aktualisieren
+                # (viertelt die teuerste Berechnung - 244M Ray-Checks/Gen)
+                # Positionsfehler ist minimal: Roboter bewegen sich nur ~3px/Frame
+                update_sensors_flag = (not training_mode) or (step_i % 4 == 0)
 
                 # --- Sensoren: Parallel (Turbo) oder Einzeln (Normal) ---------
                 if update_sensors_flag:
@@ -406,17 +422,17 @@ class CoEvolutionManager:
                             if not c.alive:
                                 continue
                             nearby = grid.get_nearby(c, collector_sensor_range)
-                            nearby_bats = [e for e in nearby if isinstance(e, Battery)]
+                            nearby_bats = [e for e in nearby if e.entity_type == ENTITY_BATTERY]
                             nearby_robs = [e for e in nearby
-                                           if isinstance(e, (Collector, Hunter)) and e is not c]
+                                           if e.entity_type != ENTITY_BATTERY and e is not c]
                             c.update_sensors(walls, nearby_bats, [c] + nearby_robs)
                         for h in hunters:
                             if not h.alive:
                                 continue
                             nearby = grid.get_nearby(h, hunter_sensor_range)
-                            nearby_bats = [e for e in nearby if isinstance(e, Battery)]
+                            nearby_bats = [e for e in nearby if e.entity_type == ENTITY_BATTERY]
                             nearby_robs = [e for e in nearby
-                                           if isinstance(e, (Collector, Hunter)) and e is not h]
+                                           if e.entity_type != ENTITY_BATTERY and e is not h]
                             h.update_sensors(walls, nearby_bats, [h] + nearby_robs)
 
                 # --- Sammler Update -------------------------------------------
@@ -425,51 +441,97 @@ class CoEvolutionManager:
                         continue
 
                     # Neuronales Netz
-                    inputs = c.get_sensor_inputs()
-                    if not inputs:
+                    if not c.sensor_data:  # Noch keine Sensordaten -> Skip
                         continue
+                    inputs = c.get_sensor_inputs()
                     output = collector_nets[i].activate(inputs)
                     
-                    radio_out = output[2] if len(output) > 2 else 0.0
-                    c.move(output[0], output[1], radio_out)
+                    radio = output[2] if len(output) > 2 else 0.0
+                    
+                    # Hard-Clamp: Ein Roboter KANN NUR schreien, wenn er einen Jäger direkt sieht.
+                    # Verhindert Kettenreaktionen (Flüsterpost), bei der alle schreien ohne Grund.
+                    sees_hunter = any(obj_type == 4 for _, obj_type, _, _ in c.sensor_data)
+                    if not sees_hunter:
+                        radio = 0.0
+
+                    c.move(output[0], output[1], radio)
                     c.clamp_to_bounds(w_width, w_height)
-                    c.check_obstacle_collision(obstacles)
+                    c.check_obstacle_collision_fast(obstacles_tuples)
 
                     # Energie + Fitness
                     c.drain_energy()
-                    if abs(c.motor_left) < 0.1 and abs(c.motor_right) < 0.1:
+                    
+                    # Anti-Kreisdreher-Logik: Vorwaertsgeschwindigkeit berechnen
+                    # v = (motor_left + motor_right) / 2
+                    forward_speed = (c.motor_left + c.motor_right) / 2.0
+                    if forward_speed < 0.1:  # Steht still, fährt rückwärts oder dreht sich nur im Kreis
                         collector_genome_list[i].fitness += idle_penalty
+                        c.fit_idle += idle_penalty
+                        
                     collector_genome_list[i].fitness += survival_bonus
+                    c.fit_surv += survival_bonus
 
-                    # Batterie sammeln
-                    if world.check_battery_collision(c):
-                        c.batteries_collected += 1
-                        collector_genome_list[i].fitness += battery_bonus
+                    # ── Proximity-Bonus & Batterie Sammeln (FUSED fuer Performance) ──
+                    nearby_bats = grid.get_nearby(c, collector_sensor_range)
+                    nearest_bat_dist_sq = collector_sensor_range * collector_sensor_range
+                    collect_dist_sq = (c.radius + 15) * (c.radius + 15)  # 15 = max battery radius
+                    
+                    for nb in nearby_bats:
+                        if nb.entity_type == ENTITY_BATTERY and nb.active:
+                            dx = c.x - nb.x
+                            dy = c.y - nb.y
+                            dsq = dx * dx + dy * dy
+                            
+                            # Kollisionspruefung
+                            if dsq < collect_dist_sq:
+                                nb.collect()
+                                c.add_energy(self.sim_config.battery_energy)
+                                c.batteries_collected += 1
+                                collector_genome_list[i].fitness += battery_bonus
+                                c.fit_battery += battery_bonus
+                                # Keine proximity fuer eingesammelte
+                                continue
+                                
+                            if dsq < nearest_bat_dist_sq:
+                                nearest_bat_dist_sq = dsq
+                                
+                    if nearest_bat_dist_sq < collector_sensor_range * collector_sensor_range:
+                        d = nearest_bat_dist_sq ** 0.5
+                        prox_bonus = bat_proximity_bonus * (1.0 - d / collector_sensor_range)
+                        collector_genome_list[i].fitness += prox_bonus
+                        c.fit_prox += prox_bonus
 
-                    # ── Proximity-Bonus: Richtung Batterie ──
-                    # Kleine Belohnung wenn nahe an einer Batterie (Gradient zum Futter)
-                    nearest_bat_dist = float('inf')
-                    for b in world.batteries:
-                        if b.active:
-                            dx = c.x - b.x
-                            dy = c.y - b.y
-                            d = (dx * dx + dy * dy) ** 0.5
-                            if d < nearest_bat_dist:
-                                nearest_bat_dist = d
-                    if nearest_bat_dist < collector_sensor_range:
-                        # Je naeher, desto mehr Bonus
-                        collector_genome_list[i].fitness += bat_proximity_bonus * (1.0 - nearest_bat_dist / collector_sensor_range)
-
-                    # ── Proximity-Malus: Weg vom Jaeger ──
-                    # Strafe wenn zu nahe an Jaeger (Gradient weg von Gefahr)
-                    for hu in hunters:
-                        if not hu.alive:
-                            continue
-                        dx = c.x - hu.x
-                        dy = c.y - hu.y
-                        d = (dx * dx + dy * dy) ** 0.5
-                        if d < danger_zone:
-                            collector_genome_list[i].fitness -= hunter_danger_penalty * (1.0 - d / danger_zone)
+                    # ── Proximity-Malus: Weg vom Jaeger (Spatial-Grid!) ──
+                    nearby_hunters = grid.get_nearby(c, danger_zone)
+                    
+                    # Track previous distances to hunters to calculate escape bonus
+                    if not hasattr(c, 'prev_hunter_dists'):
+                        c.prev_hunter_dists = {}
+                    
+                    current_hunter_dists = {}
+                    
+                    for nh in nearby_hunters:
+                        if nh.entity_type == ENTITY_HUNTER and nh.alive:
+                            dx = c.x - nh.x
+                            dy = c.y - nh.y
+                            dsq = dx * dx + dy * dy
+                            if dsq < danger_zone_sq:
+                                d = dsq ** 0.5
+                                current_hunter_dists[id(nh)] = d
+                                
+                                # Escape Bonus: If we moved further away from this hunter since last frame
+                                if id(nh) in c.prev_hunter_dists:
+                                    prev_d = c.prev_hunter_dists[id(nh)]
+                                    dist_delta = d - prev_d
+                                    if dist_delta > 0:  # Moving away!
+                                        # Bonus proportional to how fast we are escaping (max collector_speed)
+                                        # DRSTISCH ERHÖHTER FLUCHTBONUS: 5.0 statt 0.5, damit Fliehen das Lukrativste überhaupt wird!
+                                        escape_bonus = (dist_delta / self.sim_config.collector_speed) * 5.0
+                                        collector_genome_list[i].fitness += escape_bonus
+                                        c.fit_surv += escape_bonus # Dem Survival-Score im Log zuschlagen
+                                        
+                    # Update previous distances for next frame
+                    c.prev_hunter_dists = current_hunter_dists
 
                 # --- Jaeger Update --------------------------------------------
                 for i, h in enumerate(hunters):
@@ -477,39 +539,49 @@ class CoEvolutionManager:
                         continue
 
                     # Neuronales Netz
-                    inputs = h.get_sensor_inputs()
-                    if not inputs:
+                    if not h.sensor_data:  # Noch keine Sensordaten -> Skip
                         continue
+                    inputs = h.get_sensor_inputs()
                     output = hunter_nets[i].activate(inputs)
                     
-                    radio_out = output[2] if len(output) > 2 else 0.0
-                    h.move(output[0], output[1], radio_out)
+                    radio = output[2] if len(output) > 2 else 0.0
+                    
+                    # Hard-Clamp: Jäger schreien nur, wenn sie Beute (Sammler) sehen.
+                    sees_collector = any(obj_type == 3 for _, obj_type, _, _ in h.sensor_data)
+                    if not sees_collector:
+                        radio = 0.0
+                        
+                    h.move(output[0], output[1], radio)
                     h.clamp_to_bounds(w_width, w_height)
-                    h.check_obstacle_collision(obstacles)
+                    h.check_obstacle_collision_fast(obstacles_tuples)
 
                     # Energie + Fitness
                     h.drain_energy()
-                    if abs(h.motor_left) < 0.1 and abs(h.motor_right) < 0.1:
+                    
+                    forward_speed = (h.motor_left + h.motor_right) / 2.0
+                    if forward_speed < 0.1:
                         hunter_genome_list[i].fitness += idle_penalty
+                    hunter_genome_list[i].fitness += survival_bonus
 
                     # ── Proximity-Bonus: Richtung Sammler ──
                     # Jaeger bekommen Bonus wenn nahe an Sammlern
-                    nearest_prey_dist = float('inf')
-                    for prey in collectors:
-                        if not prey.alive:
-                            continue
-                        dx = h.x - prey.x
-                        dy = h.y - prey.y
-                        d = (dx * dx + dy * dy) ** 0.5
-                        if d < nearest_prey_dist:
-                            nearest_prey_dist = d
-                    if nearest_prey_dist < hunter_sensor_range:
-                        hunter_genome_list[i].fitness += 0.1 * (1.0 - nearest_prey_dist / hunter_sensor_range)
+                    nearby_prey = grid.get_nearby(h, hunter_sensor_range)
+                    nearest_prey_dist_sq = hunter_sensor_range * hunter_sensor_range
+                    for np_ in nearby_prey:
+                        if np_.entity_type == ENTITY_COLLECTOR and np_.alive:
+                            dx = h.x - np_.x
+                            dy = h.y - np_.y
+                            dsq = dx * dx + dy * dy
+                            if dsq < nearest_prey_dist_sq:
+                                nearest_prey_dist_sq = dsq
+                    if nearest_prey_dist_sq < hunter_sensor_range * hunter_sensor_range:
+                        d = nearest_prey_dist_sq ** 0.5
+                        hunter_genome_list[i].fitness += 0.1 * (1.0 - d / hunter_sensor_range)
 
                     # Sammler fressen (Kollisionspruefung)
                     nearby_collectors = [e for e in
                                          grid.get_nearby(h, h.radius + 20)
-                                         if isinstance(e, Collector) and e.alive]
+                                         if e.entity_type == ENTITY_COLLECTOR and e.alive]
                     for prey in nearby_collectors:
                         dx = h.x - prey.x
                         dy = h.y - prey.y
@@ -522,8 +594,9 @@ class CoEvolutionManager:
                             h.add_energy(energy_refill)
                             hunter_genome_list[i].fitness += kill_bonus
                             # Sammler bekommt Strafe
-                            prey_idx = collectors.index(prey)
+                            prey_idx = collector_idx_map[id(prey)]
                             collector_genome_list[prey_idx].fitness += eaten_penalty
+                            prey.fit_death += eaten_penalty
 
                 # Welt updaten
                 world.update()
@@ -533,6 +606,29 @@ class CoEvolutionManager:
                 world.draw(screen)
                 for r in all_robots:
                     draw_sensors(screen, r, show_sensors)
+                    if show_radio and getattr(r, 'alive', False):
+                        # Sigmoid ruht bei 0.5. Nur Werte darüber sind aktives "Schreien".
+                        intensity = (getattr(r, 'radio_out', 0.0) - 0.5) * 2.0
+                        if intensity > 0.1:
+                            radius = int(r.config.radio_range)
+                            alpha_fill = int(intensity * 25)      # Sehr dezente Füllung
+                            alpha_outline = int(intensity * 180)  # Kräftigere Ränder
+                            
+                            # Padding hinzufügen, damit dicke Ränder nicht abgeschnitten werden
+                            pad = 4
+                            surf = pygame.Surface((radius * 2 + pad * 2, radius * 2 + pad * 2), pygame.SRCALPHA)
+                            
+                            center = (radius + pad, radius + pad)
+                            
+                            # Sanfte Hintergrundfüllung
+                            pygame.draw.circle(surf, (100, 200, 255, alpha_fill), center, radius)
+                            
+                            # Funk-Wellen (konzentrische Kreise)
+                            pygame.draw.circle(surf, (100, 200, 255, alpha_outline), center, radius, 2)
+                            pygame.draw.circle(surf, (100, 200, 255, int(alpha_outline * 0.6)), center, int(radius * 0.66), 1)
+                            pygame.draw.circle(surf, (100, 200, 255, int(alpha_outline * 0.3)), center, int(radius * 0.33), 1)
+                            
+                            screen.blit(surf, (int(r.x) - radius - pad, int(r.y) - radius - pad))
                     r.draw(screen)
                 self._draw_hud(screen, clock, collectors, hunters, world,
                                current_step, total_frames)
@@ -540,13 +636,25 @@ class CoEvolutionManager:
                 clock.tick(FPS_TARGET)
 
         # --- Fitness finalisieren ---------------------------------------------
-        c_fits = [g.fitness for g in collector_genome_list]
+        # Nur echte trainierende Genome fuer die Statistik werten
+        c_fits = [g.fitness for g in collector_genome_list if not getattr(g, 'is_injected', False)]
         h_fits = [g.fitness for g in hunter_genome_list]
 
         self.avg_collector_fitness = sum(c_fits) / len(c_fits) if c_fits else 0
         self.best_collector_fitness = max(c_fits) if c_fits else 0
         self.avg_hunter_fitness = sum(h_fits) / len(h_fits) if h_fits else 0
         self.best_hunter_fitness = max(h_fits) if h_fits else 0
+
+        # Breakdown der Fitness fuer Debugging (Nur echte trainierende Sammler)
+        real_collectors = [c for c in collectors if not c.is_injected]
+        avg_fit_bat = sum(c.fit_battery for c in real_collectors) / len(real_collectors) if real_collectors else 0
+        avg_fit_prox = sum(c.fit_prox for c in real_collectors) / len(real_collectors) if real_collectors else 0
+        avg_fit_surv = sum(c.fit_surv for c in real_collectors) / len(real_collectors) if real_collectors else 0
+        avg_fit_pen = sum(c.fit_hunter_pen for c in real_collectors) / len(real_collectors) if real_collectors else 0
+        avg_fit_death = sum(c.fit_death for c in real_collectors) / len(real_collectors) if real_collectors else 0
+        avg_fit_idle = sum(c.fit_idle for c in real_collectors) / len(real_collectors) if real_collectors else 0
+        
+        print(f"[FITNESS BREAKDOWN AVG] Bat: {avg_fit_bat:.1f} | Prox: {avg_fit_prox:.1f} | Surv: {avg_fit_surv:.1f} | Pen: {avg_fit_pen:.1f} | Death: {avg_fit_death:.1f} | Idle: {avg_fit_idle:.1f}")
 
         total_kills = sum(h.kills for h in hunters)
         total_bats = sum(c.batteries_collected for c in collectors)
@@ -650,7 +758,7 @@ class CoEvolutionManager:
         self.hunter_pop.generation += 1
 
         self.generation += 1
-        return (True, show_sensors, training_mode, speed_multiplier)
+        return (True, show_sensors, show_radio, training_mode, speed_multiplier)
 
     def _draw_hud(self, screen: pygame.Surface, clock: pygame.time.Clock,
                   collectors: list[Collector], hunters: list[Hunter],
@@ -744,17 +852,18 @@ def run_neat_training(config: SimConfig, screen: pygame.Surface,
                                  injected_entries=injected_entries)
 
     show_sensors = False
+    show_radio = False
     training_mode = False
     speed_multiplier = 1
 
     print(f"[NEAT] Starte Co-Evolution (Unendlich)")
-    print(f"[NEAT] Tasten: T=Training, S=Sensoren, +/-=Speed, ESC=Beenden")
+    print(f"[NEAT] Tasten: T=Training, S=Sensoren, F=Funk, +/-=Speed, ESC=Beenden")
 
     gen = 0
     while True:
         result = manager.run_generation(
-            screen, clock, show_sensors, training_mode, speed_multiplier)
-        cont, show_sensors, training_mode, speed_multiplier = result
+            screen, clock, show_sensors, show_radio, training_mode, speed_multiplier)
+        cont, show_sensors, show_radio, training_mode, speed_multiplier = result
         if not cont:
             print(f"[NEAT] Training abgebrochen in Generation {gen}")
             commentary.post_event("custom",

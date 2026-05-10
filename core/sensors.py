@@ -325,10 +325,10 @@ def cast_rays(robot, walls: list[tuple[int, int, int, int]],
         object_type: OBJ_NONE/OBJ_WALL/OBJ_BATTERY/OBJ_COLLECTOR/OBJ_HUNTER.
         hit_x, hit_y: Trefferpunkt-Koordinaten (für Visualisierung).
     """
-    from core.entities import Hunter
+    from core.entities import Hunter, ENTITY_HUNTER
     
     ray_count = config.sensor_ray_count
-    if isinstance(robot, Hunter):
+    if getattr(robot, 'entity_type', -1) == ENTITY_HUNTER:
         max_length = config.hunter_sensor_ray_length
         fov_rad = math.radians(config.hunter_sensor_fov)
     else:
@@ -364,7 +364,7 @@ def cast_rays(robot, walls: list[tuple[int, int, int, int]],
         bat_r = np.empty(0, dtype=np.float64)
 
     # Roboter im Umkreis zu NumPy-Arrays konvertieren
-    from core.entities import Collector, Hunter
+    from core.entities import Collector, Hunter, ENTITY_HUNTER
     nearby_rob_x = []
     nearby_rob_y = []
     nearby_rob_r = []
@@ -380,7 +380,7 @@ def cast_rays(robot, walls: list[tuple[int, int, int, int]],
             nearby_rob_x.append(r.x)
             nearby_rob_y.append(r.y)
             nearby_rob_r.append(r.radius)
-            if isinstance(r, Hunter):
+            if getattr(r, 'entity_type', -1) == ENTITY_HUNTER:
                 nearby_rob_type.append(4.0)  # OBJ_HUNTER
             else:
                 nearby_rob_type.append(3.0)  # OBJ_COLLECTOR
@@ -425,7 +425,7 @@ def cast_rays_batch(robot_list: list, walls: list, batteries: list,
         all_robots: Liste aller Roboter (fuer Erkennung anderer Roboter).
         config: Simulationskonfiguration.
     """
-    from core.entities import Collector, Hunter
+    from core.entities import Collector, Hunter, ENTITY_HUNTER
 
     # Lebende Roboter filtern
     alive_robots = [r for r in robot_list if r.alive]
@@ -434,7 +434,7 @@ def cast_rays_batch(robot_list: list, walls: list, batteries: list,
         return
 
     ray_count = config.sensor_ray_count
-    if isinstance(alive_robots[0], Hunter):
+    if getattr(alive_robots[0], 'entity_type', -1) == ENTITY_HUNTER:
         max_length = config.hunter_sensor_ray_length
         fov_rad = math.radians(config.hunter_sensor_fov)
     else:
@@ -480,7 +480,7 @@ def cast_rays_batch(robot_list: list, walls: list, batteries: list,
         rob_data_x.append(r.x)
         rob_data_y.append(r.y)
         rob_data_r.append(r.radius)
-        if isinstance(r, Hunter):
+        if getattr(r, 'entity_type', -1) == ENTITY_HUNTER:
             rob_data_type.append(4.0)  # OBJ_HUNTER
         else:
             rob_data_type.append(3.0)  # OBJ_COLLECTOR
